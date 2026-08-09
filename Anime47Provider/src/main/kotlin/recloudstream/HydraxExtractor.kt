@@ -304,20 +304,26 @@ object HydraxInterceptor : Interceptor {
     }
 
     /**
-     * Lazily fetches Abyss segments as the player consumes bytes.
+     * Lazily streams Abyss segments as the player consumes bytes.
      *
-     * Tối ưu độ trễ "bấm play chờ lâu" / giật giữa chừng:
-     * 1. OkHttpClient dùng chung có connection pool lớn hơn mặc định (xem CLIENT bên
-     *    dưới) — tránh phải bắt tay TLS lại từ đầu cho mỗi segment request.
-     * 2. Prefetch: ngay khi bắt đầu đọc segment N, một coroutine nền được kích hoạt để
-     *    tải trước segment N+1 song song, để lúc player đọc hết buffer hiện tại thì
-     *    segment kế tiếp đã sẵn sàng (hoặc gần sẵn sàng) thay vì phải chờ một round-trip
-     *    hoàn toàn mới — giảm giật khi chuyển giữa các segment 2MB.
+     * Tối ưu độ trễ "vào player rồi loading lâu mới có hình":
+     * 1. STREAMING THẬT SỰ (thay đổi quan trọng nhất): bản gốc gọi resp.body.bytes()
+     *    — tải nguyên 2MB segment vào RAM rồi mới trả byte đầu tiên cho player, nên
+     *    player phải chờ trọn 2MB tải xong mới bắt đầu decode/hiển thị hình. Bản này
+     *    giữ kết nối HTTP đang mở (BufferedSource) và forward dữ liệu cho player ngay
+     *    khi network trả về, không đợi tải hết segment — giảm đáng kể thời gian tới
+     *    byte đầu tiên, đặc biệt quan trọng cho lần load đầu của mỗi video.
+     * 2. OkHttpClient dùng chung có connection pool lớn hơn mặc định — tránh phải bắt
+     *    tay TLS lại từ đầu cho mỗi segment request.
+     * 3. Prefetch: song song với việc đọc segment hiện tại, một coroutine nền tải
+     *    trước segment kế tiếp (vẫn dùng cách tải trọn vào RAM vì không cần độ trễ
+     *    thấp ở đây — mục tiêu là có sẵn trước khi cần), để giảm giật khi chuyển
+     *    giữa các segment 2MB.
      *
      * Lưu ý: kích thước segment (FRAGMENT_SIZE = 2MB) do server Abyss chunk cố định,
      * không thể xin một kích thước nhỏ hơn cho riêng lần tải đầu — nên độ trễ khi bấm
-     * play lần đầu chủ yếu phụ thuộc tốc độ mạng tới CDN, không thể giảm thêm ở phía
-     * client ngoài việc tái sử dụng connection đã warm-up.
+     * play lần đầu (trước khi vào player, lúc lấy metadata + link) vẫn phụ thuộc tốc
+     * độ mạng tới abysscdn.com, không thể giảm thêm ở phía client.
      */
     private class SegmentSource(
         private val client: OkHttpClient,
@@ -337,38 +343,142 @@ object HydraxInterceptor : Interceptor {
         private val prefetchInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
         private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(2)
 
+        // Kết nối HTTP đang mở cho segment hiện tại (đọc dần, KHÔNG tải hết vào RAM
+        // trước khi trả cho player — xem ghi chú ở đầu class).
+        private var openResponse: Response? = null
+        private var openSource: okio.BufferedSource? = null
+        private var openSegIndex: Int = -1
+
         override fun read(sink: Buffer, byteCount: Long): Long {
             if (currentPos > endByteInclusive) return -1L
 
-            if (currentBuffer.exhausted()) {
-                val segIndex = (currentPos / FRAGMENT_SIZE).toInt()
-                val segStart = segIndex.toLong() * FRAGMENT_SIZE
+            val segIndex = (currentPos / FRAGMENT_SIZE).toInt()
+            val segStart = segIndex.toLong() * FRAGMENT_SIZE
 
-                val segmentBytes = takeFromCacheOrFetch(segIndex)
-                if (segmentBytes.isEmpty()) return -1L
-                val offsetInSeg = (currentPos - segStart).toInt().coerceIn(0, segmentBytes.size)
-                currentBuffer.write(segmentBytes, offsetInSeg, segmentBytes.size - offsetInSeg)
+            // Ưu tiên dữ liệu đã prefetch sẵn trong RAM (đã tải xong từ trước) — trường
+            // hợp này copy thẳng, không cần mở connection mới.
+            if (currentBuffer.exhausted() && openSegIndex != segIndex) {
+                prefetchCache.remove(segIndex)?.let { bytes ->
+                    val offsetInSeg = (currentPos - segStart).toInt().coerceIn(0, bytes.size)
+                    currentBuffer.write(bytes, offsetInSeg, bytes.size - offsetInSeg)
+                    schedulePrefetch(segIndex + 1)
+                }
+            }
 
-                // Kích hoạt prefetch segment kế tiếp trong nền, không chặn read() hiện tại.
-                schedulePrefetch(segIndex + 1)
+            if (!currentBuffer.exhausted()) {
+                val remaining = endByteInclusive - currentPos + 1
+                val toRead = minOf(byteCount, remaining, currentBuffer.size)
+                if (toRead <= 0) return -1L
+                val read = currentBuffer.read(sink, toRead)
+                if (read > 0) currentPos += read
+                return read
+            }
+
+            // Chưa có sẵn trong buffer/cache: đọc trực tiếp (streaming) từ kết nối HTTP,
+            // mở kết nối mới nếu chưa có hoặc đã chuyển sang segment khác.
+            if (openSegIndex != segIndex) {
+                closeOpenConnection()
+                val opened = openSegmentStream(segIndex) ?: return -1L
+                openResponse = opened.first
+                openSource = opened.second
+                openSegIndex = segIndex
+
+                // Bỏ qua phần đầu segment nếu currentPos không trùng đầu segment
+                // (trường hợp resume giữa segment sau khi đã đọc một phần).
+                val skipBytes = currentPos - segStart
+                if (skipBytes > 0) {
+                    openSource?.skip(skipBytes)
+                }
             }
 
             val remaining = endByteInclusive - currentPos + 1
-            val toRead = minOf(byteCount, remaining, currentBuffer.size)
-            if (toRead <= 0) return -1L
-            val read = currentBuffer.read(sink, toRead)
-            if (read > 0) currentPos += read
+            val wantToRead = minOf(byteCount, remaining, FRAGMENT_SIZE)
+            var read = try {
+                openSource?.read(sink, wantToRead) ?: -1L
+            } catch (e: Exception) {
+                -1L
+            }
+
+            // read == -1 có 2 khả năng: (a) đã đọc hết đúng segment này (bình thường,
+            // segment cuối cùng của file có thể nhỏ hơn FRAGMENT_SIZE), hoặc (b) kết nối
+            // bị gián đoạn giữa chừng trước khi đọc đủ dữ liệu mong đợi. Phân biệt bằng
+            // cách so sánh currentPos với ranh giới segment: nếu chưa tới ranh giới mà đã
+            // -1, thử mở lại kết nối đúng 1 lần trước khi coi là lỗi thật.
+            if (read <= 0) {
+                val segEndExclusive = minOf(segStart + FRAGMENT_SIZE, endByteInclusive + 1)
+                val genuinelyAtSegmentEnd = currentPos >= segEndExclusive
+                if (!genuinelyAtSegmentEnd) {
+                    closeOpenConnection()
+                    val retryOpened = openSegmentStream(segIndex)
+                    if (retryOpened != null) {
+                        openResponse = retryOpened.first
+                        openSource = retryOpened.second
+                        openSegIndex = segIndex
+                        val skipBytes = currentPos - segStart
+                        if (skipBytes > 0) openSource?.skip(skipBytes)
+                        read = try {
+                            openSource?.read(sink, wantToRead) ?: -1L
+                        } catch (e: Exception) {
+                            -1L
+                        }
+                    }
+                }
+            }
+
+            if (read > 0) {
+                currentPos += read
+                // Ngay khi bắt đầu đọc segment hiện tại, kích hoạt prefetch cho segment
+                // kế tiếp chạy song song trong nền (không dùng chung connection này).
+                schedulePrefetch(segIndex + 1)
+            } else {
+                // Hết segment hiện tại (hoặc lỗi không thể phục hồi) -> đóng connection,
+                // lần read() sau sẽ tự mở segment kế tiếp.
+                closeOpenConnection()
+            }
             return read
         }
 
         override fun timeout(): Timeout = Timeout.NONE
         override fun close() {
+            closeOpenConnection()
             prefetchExecutor.shutdownNow()
         }
 
-        private fun takeFromCacheOrFetch(index: Int): ByteArray {
-            prefetchCache.remove(index)?.let { return it }
-            return fetchSegment(index)
+        private fun closeOpenConnection() {
+            try {
+                openResponse?.close()
+            } catch (e: Exception) {
+                // ignore
+            }
+            openResponse = null
+            openSource = null
+            openSegIndex = -1
+        }
+
+        /** Mở kết nối HTTP tới segment nhưng KHÔNG đọc hết body — trả về source để đọc dần. */
+        private fun openSegmentStream(index: Int): Pair<Response, okio.BufferedSource>? {
+            val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
+            val token = tokenFor(path)
+            val segUrl = "$baseUrl/sora/$totalSize/$token"
+            val req = Request.Builder()
+                .url(segUrl)
+                .header("Referer", "https://abysscdn.com/")
+                .build()
+            return runCatching {
+                val resp = client.newCall(req).execute()
+                if (!resp.isSuccessful) {
+                    resp.close()
+                    null
+                } else {
+                    val source = resp.body?.source()
+                    if (source == null) {
+                        resp.close()
+                        null
+                    } else {
+                        resp to source
+                    }
+                }
+            }.getOrNull()
         }
 
         private fun schedulePrefetch(nextIndex: Int) {
@@ -389,6 +499,7 @@ object HydraxInterceptor : Interceptor {
             }
         }
 
+        /** Tải trọn segment vào RAM — dùng riêng cho prefetch chạy nền (không cần độ trễ thấp). */
         private fun fetchSegment(index: Int): ByteArray {
             val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
             val token = tokenFor(path)
