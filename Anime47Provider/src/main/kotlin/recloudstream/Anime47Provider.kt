@@ -398,30 +398,17 @@ class Anime47Provider : MainAPI() {
                 )
             }
 
-            // LƯU Ý (fix lỗi "ưu tiên nguồn"/Nguồn luôn chỉ hiện "Anime47"):
-            // Trước đây bước flatten này chỉ giữ lại EpisodeListItem (id, number, title) và
-            // BỎ MẤT team_name (tên nhóm sub: Kanefusa, OliviaSub, Yamisora, Koga Fansub, ...)
-            // của EpisodeTeam chứa nó. Do đó ở loadLinks(), app không còn biết một id thuộc
-            // team nào nữa, và tên nguồn hiển thị trong popup "Nguồn" chỉ còn lại tên chung
-            // của provider ("Anime47") thay vì "TênTeam | FE"/"TênTeam | HY" như dữ liệu gốc.
-            // Sửa: giữ lại team_name song song với từng id bằng EpisodeSourceRef, rồi nhúng
-            // cả danh sách (id, team) vào "data" của tập thay vì chỉ danh sách id.
             val episodeItems = episodeResponse?.teams
-                ?.flatMap { team ->
-                    team.groups.flatMap { group ->
-                        group.episodes.map { ep -> Triple(ep, team.team_name, group.name) }
-                    }
-                }
-                ?.filter { (ep, _, _) -> ep.number != null }
+                ?.flatMap { it.groups }
+                ?.flatMap { it.episodes }
+                ?.filter { it.number != null }
 
             val episodes = if (episodeItems != null) {
                 episodeItems
-                    .groupBy { (ep, _, _) -> ep.number!! }
+                    .groupBy { it.number!! }
                     .map { (number, items) ->
-                        val refs = items
-                            .map { (ep, teamName, _) -> EpisodeSourceRef(ep.id, teamName) }
-                            .distinctBy { it.id }
-                        val data = toJson(refs)
+                        val ids = items.map { it.id }.distinct()
+                        val data = toJson(ids)
                         newEpisode(data) {
                             this.name = "Tập $number"
                             this.episode = number
@@ -464,50 +451,33 @@ class Anime47Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // "data" giờ có thể là JSON list of EpisodeSourceRef([{"id":..,"team":..}, ...]) mới,
-        // hoặc list of Int cũ (dữ liệu tập đã lưu/cache từ trước khi sửa lỗi này) — vẫn phải
-        // đọc được để không vỡ tập đã bookmark, chỉ là sẽ không có tên team trong trường hợp đó.
-        val episodeRefs: List<EpisodeSourceRef> = try {
+        val episodeIds: List<Int> = try {
             if (data.startsWith("[")) {
-                try {
-                    mapper.readValue(data, object : TypeReference<List<EpisodeSourceRef>>() {})
-                } catch (e: Exception) {
-                    mapper.readValue(data, object : TypeReference<List<Int>>() {})
-                        .map { EpisodeSourceRef(it, null) }
-                }
+                mapper.readValue(data, object : TypeReference<List<Int>>() {})
             } else {
-                listOf(EpisodeSourceRef(data.toInt(), null))
+                listOf(data.toInt())
             }
         } catch (e: Exception) {
             return false
         }
 
-        if (episodeRefs.isEmpty()) return false
+        if (episodeIds.isEmpty()) return false
 
         val loaded = AtomicBoolean(false)
         val referer = "$mainUrl/"
 
         coroutineScope {
-            episodeRefs.map { ref ->
+            episodeIds.map { id ->
                 async {
                     try {
                         val watchResponse: ApiWatchResponse? =
-                            fetchApi("$apiBaseUrl/anime/watch/episode/${ref.id}?lang=vi")
+                            fetchApi("$apiBaseUrl/anime/watch/episode/$id?lang=vi")
 
                         val streams = watchResponse?.streams ?: return@async
-                        // Tên team (Kanefusa, OliviaSub, Yamisora, Koga Fansub, ...) đi kèm id
-                        // tập từ EpisodeSourceRef, dùng làm tiền tố "Nguồn" giống app gốc, thay
-                        // vì luôn để trống và mọi link rơi chung vào một nguồn "Anime47".
-                        val teamLabel = ref.team?.trim()?.takeIf { it.isNotBlank() }
 
                         for (stream in streams) {
                             val url = stream.url
-                            val rawServerName = stream.server_name
-                            val serverName = if (!teamLabel.isNullOrBlank()) {
-                                if (!rawServerName.isNullOrBlank()) "$teamLabel | $rawServerName" else teamLabel
-                            } else {
-                                rawServerName
-                            }
+                            val serverName = stream.server_name
 
                             if (url.isNullOrBlank()) continue
 
@@ -557,18 +527,9 @@ class Anime47Provider : MainAPI() {
                                 }
                             }
 
-                            // LƯU Ý: trước đây "source" (tham số đầu) luôn cố định là tên provider
-                            // ("Anime47"), khiến màn "Ưu tiên nguồn" (Settings/Profile > Edit)
-                            // của CloudStream — vốn chấm điểm ưu tiên dựa trên field "source" chứ
-                            // không phải "name" — luôn chỉ thấy đúng 1 nguồn "Anime47" dù có nhiều
-                            // team/server khác nhau. Sửa: cho "source" trùng với "name" (nhãn
-                            // "TeamName | Server") để có thể ưu tiên riêng từng team/server ở đó.
-                            // Fallback về tên provider khi không có team lẫn server (dữ liệu cũ)
-                            // để không phá vỡ các phần khác của app dựa vào "source" = tên provider.
-                            val displaySource = serverName ?: this@Anime47Provider.name
                             val link = newExtractorLink(
-                                displaySource,
-                                displaySource,
+                                this@Anime47Provider.name,
+                                serverName ?: this@Anime47Provider.name,
                                 url,
                                 ExtractorLinkType.M3U8
                             ) {
@@ -704,14 +665,6 @@ class Anime47Provider : MainAPI() {
         val title: String?
     )
 
-    // Gắn tên team (Kanefusa, OliviaSub, Yamisora, Koga Fansub, ...) với từng episode id,
-    // được nhúng vào "data" của Episode ở load() và đọc lại ở loadLinks() để dựng đúng
-    // tên nguồn "TeamName | ServerName" thay vì luôn chỉ hiện tên provider "Anime47".
-    data class EpisodeSourceRef(
-        val id: Int,
-        val team: String?
-    )
-
     data class EpisodeGroup(
         val name: String?,
         val episodes: List<EpisodeListItem>
@@ -781,5 +734,4 @@ class Anime47Provider : MainAPI() {
         val has_more: Boolean?
     )
 }
- 
- 
+  
