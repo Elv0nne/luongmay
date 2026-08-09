@@ -204,12 +204,8 @@ object HydraxExtractor {
             val relayUrl = buildRelayUrl(baseUrl, md5Id, resId, size)
             val quality = source.label?.filter { it.isDigit() }?.toIntOrNull() ?: Qualities.Unknown.value
 
-            // "source" trùng với "name" (displayBaseName, vd. "OliviaSub | HY") thay vì
-            // luôn cố định providerName ("Anime47"), để màn "Ưu tiên nguồn" của CloudStream
-            // (chấm điểm dựa trên field "source") phân biệt được từng team/server thay vì
-            // gộp chung mọi link HY vào 1 dòng "Anime47" — xem giải thích trong Anime47Provider.kt.
             newExtractorLink(
-                displayBaseName,
+                providerName,
                 displayBaseName,
                 relayUrl,
                 ExtractorLinkType.VIDEO
@@ -548,5 +544,4 @@ object HydraxInterceptor : Interceptor {
         }
     }
 }
- 
- 
+  
