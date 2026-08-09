@@ -557,9 +557,18 @@ class Anime47Provider : MainAPI() {
                                 }
                             }
 
+                            // LƯU Ý: trước đây "source" (tham số đầu) luôn cố định là tên provider
+                            // ("Anime47"), khiến màn "Ưu tiên nguồn" (Settings/Profile > Edit)
+                            // của CloudStream — vốn chấm điểm ưu tiên dựa trên field "source" chứ
+                            // không phải "name" — luôn chỉ thấy đúng 1 nguồn "Anime47" dù có nhiều
+                            // team/server khác nhau. Sửa: cho "source" trùng với "name" (nhãn
+                            // "TeamName | Server") để có thể ưu tiên riêng từng team/server ở đó.
+                            // Fallback về tên provider khi không có team lẫn server (dữ liệu cũ)
+                            // để không phá vỡ các phần khác của app dựa vào "source" = tên provider.
+                            val displaySource = serverName ?: this@Anime47Provider.name
                             val link = newExtractorLink(
-                                this@Anime47Provider.name,
-                                serverName ?: this@Anime47Provider.name,
+                                displaySource,
+                                displaySource,
                                 url,
                                 ExtractorLinkType.M3U8
                             ) {
