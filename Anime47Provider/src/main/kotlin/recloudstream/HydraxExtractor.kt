@@ -230,7 +230,14 @@ object HydraxExtractor {
 object HydraxInterceptor : Interceptor {
 
     private const val FRAGMENT_SIZE = 2097152L
-    private val client = OkHttpClient()
+    // Connection pool lớn hơn mặc định (5) để giữ kết nối tới CDN sống lâu hơn giữa các
+    // segment request liên tiếp và cho prefetch chạy song song, tránh phải bắt tay TLS
+    // lại từ đầu mỗi lần — đây là phần đóng góp lớn vào độ trễ "chờ lấy link stream lâu".
+    private val client = OkHttpClient.Builder()
+        .connectionPool(okhttp3.ConnectionPool(8, 60, java.util.concurrent.TimeUnit.SECONDS))
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -296,7 +303,22 @@ object HydraxInterceptor : Interceptor {
             .build()
     }
 
-    /** Lazily fetches 2MB Abyss segments as the player consumes bytes, one segment ahead at most. */
+    /**
+     * Lazily fetches Abyss segments as the player consumes bytes.
+     *
+     * Tối ưu độ trễ "bấm play chờ lâu" / giật giữa chừng:
+     * 1. OkHttpClient dùng chung có connection pool lớn hơn mặc định (xem CLIENT bên
+     *    dưới) — tránh phải bắt tay TLS lại từ đầu cho mỗi segment request.
+     * 2. Prefetch: ngay khi bắt đầu đọc segment N, một coroutine nền được kích hoạt để
+     *    tải trước segment N+1 song song, để lúc player đọc hết buffer hiện tại thì
+     *    segment kế tiếp đã sẵn sàng (hoặc gần sẵn sàng) thay vì phải chờ một round-trip
+     *    hoàn toàn mới — giảm giật khi chuyển giữa các segment 2MB.
+     *
+     * Lưu ý: kích thước segment (FRAGMENT_SIZE = 2MB) do server Abyss chunk cố định,
+     * không thể xin một kích thước nhỏ hơn cho riêng lần tải đầu — nên độ trễ khi bấm
+     * play lần đầu chủ yếu phụ thuộc tốc độ mạng tới CDN, không thể giảm thêm ở phía
+     * client ngoài việc tái sử dụng connection đã warm-up.
+     */
     private class SegmentSource(
         private val client: OkHttpClient,
         private val baseUrl: String,
@@ -310,16 +332,25 @@ object HydraxInterceptor : Interceptor {
         private var currentPos = startByte
         private val currentBuffer = Buffer()
 
+        // Cache segment đã prefetch để không tải lại khi tới lượt đọc thật.
+        private val prefetchCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
+        private val prefetchInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
+        private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(2)
+
         override fun read(sink: Buffer, byteCount: Long): Long {
             if (currentPos > endByteInclusive) return -1L
 
             if (currentBuffer.exhausted()) {
                 val segIndex = (currentPos / FRAGMENT_SIZE).toInt()
                 val segStart = segIndex.toLong() * FRAGMENT_SIZE
-                val segmentBytes = fetchSegment(segIndex)
+
+                val segmentBytes = takeFromCacheOrFetch(segIndex)
                 if (segmentBytes.isEmpty()) return -1L
                 val offsetInSeg = (currentPos - segStart).toInt().coerceIn(0, segmentBytes.size)
                 currentBuffer.write(segmentBytes, offsetInSeg, segmentBytes.size - offsetInSeg)
+
+                // Kích hoạt prefetch segment kế tiếp trong nền, không chặn read() hiện tại.
+                schedulePrefetch(segIndex + 1)
             }
 
             val remaining = endByteInclusive - currentPos + 1
@@ -331,7 +362,32 @@ object HydraxInterceptor : Interceptor {
         }
 
         override fun timeout(): Timeout = Timeout.NONE
-        override fun close() {}
+        override fun close() {
+            prefetchExecutor.shutdownNow()
+        }
+
+        private fun takeFromCacheOrFetch(index: Int): ByteArray {
+            prefetchCache.remove(index)?.let { return it }
+            return fetchSegment(index)
+        }
+
+        private fun schedulePrefetch(nextIndex: Int) {
+            val nextSegStart = nextIndex.toLong() * FRAGMENT_SIZE
+            if (nextSegStart > endByteInclusive) return
+            if (prefetchCache.containsKey(nextIndex)) return
+            if (!prefetchInFlight.add(nextIndex)) return
+
+            prefetchExecutor.submit {
+                try {
+                    val bytes = fetchSegment(nextIndex)
+                    if (bytes.isNotEmpty()) {
+                        prefetchCache[nextIndex] = bytes
+                    }
+                } finally {
+                    prefetchInFlight.remove(nextIndex)
+                }
+            }
+        }
 
         private fun fetchSegment(index: Int): ByteArray {
             val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
