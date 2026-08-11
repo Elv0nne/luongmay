@@ -67,6 +67,75 @@ class Anime47Provider : MainAPI() {
     private val interceptor = CloudflareKiller()
     private var cachedToken: String? = null
 
+    // ===================== DCC: điểm danh & lưu lịch sử xem =====================
+    // Xác nhận qua DevTools (bắt request thật của web anime47.love):
+    //  - Điểm danh hằng ngày: gọi GET "$apiBaseUrl/dcc/info" một lần mỗi session
+    //    (lần đầu getMainPage được gọi), tương đương hành vi "mở web/app" của user
+    //    thật. Server tự xử lý điểm danh phía họ khi phát hiện phiên truy cập mới.
+    //  - Lưu lịch sử xem: gọi POST "$apiBaseUrl/profile/history/mark-episode" với
+    //    body {"episode_id": <id>} khi user mở 1 tập và lấy được link phát. Đây là
+    //    hành vi thật (tương ứng "user đã mở tập này ra xem"), phản ánh đúng sự thật
+    //    về phía app, không giả lập gì thêm.
+    //
+    // LƯU Ý QUAN TRỌNG: mark-episode CHỈ lưu lịch sử, KHÔNG phải nơi cộng điểm DCC.
+    // Theo DevTools, điểm "+N DCC" thật ra được cộng bởi endpoint riêng
+    // "$apiBaseUrl/dcc/watch-progress", được web gọi lặp lại mỗi ~30 giây trong lúc
+    // phát với { episode_id, progress_seconds, seconds_watched: 30 }, và server chỉ
+    // thưởng điểm khi progress_seconds tích lũy đạt khoảng ~80% thời lượng tập.
+    // Cloudstream's loadLinks() không có cách nào biết chính xác player đang phát
+    // đến giây thứ mấy hoặc user có thực sự đang xem hay không (không có hook theo
+    // dõi tiến trình phát từ phía provider). Vì việc gọi watch-progress đòi hỏi báo
+    // cáo thời lượng xem thực tế, ta KHÔNG giả lập heartbeat này ở đây — làm vậy sẽ
+    // là gửi dữ liệu "đã xem" không có thật lên server. Do đó điểm DCC theo thời
+    // gian xem sẽ KHÔNG được cộng tự động qua app; user vẫn cần xem qua web thật để
+    // nhận điểm đó. Phần dưới đây chỉ xử lý điểm danh + lưu lịch sử, là 2 hành vi
+    // phản ánh đúng thực tế thao tác của user trên app.
+    //
+    // Cả hai request đều "best effort": lỗi mạng/hết hạn token không được throw ra
+    // ngoài, để không làm gián đoạn việc xem phim nếu hệ thống điểm gặp sự cố.
+    private val dailyCheckinDone = AtomicBoolean(false)
+
+    private suspend fun triggerDailyCheckinOnce() {
+        if (!dailyCheckinDone.compareAndSet(false, true)) return
+
+        try {
+            val headers = getAuthHeaders()
+            if (!headers.containsKey("Authorization")) return // chưa đăng nhập, bỏ qua
+
+            app.get(
+                "$apiBaseUrl/dcc/info",
+                headers = headers,
+                interceptor = interceptor,
+                timeout = 10000
+            )
+        } catch (e: Exception) {
+            // Không chặn luồng chính nếu điểm danh lỗi (mạng, token hết hạn, v.v.)
+        }
+    }
+
+    private suspend fun markEpisodeWatched(episodeId: Int) {
+        try {
+            val headers = getAuthHeaders()
+            if (!headers.containsKey("Authorization")) return // chưa đăng nhập, bỏ qua
+
+            val body = toJson(mapOf("episode_id" to episodeId))
+                .toRequestBody("application/json".toMediaTypeOrNull())
+
+            app.post(
+                "$apiBaseUrl/profile/history/mark-episode",
+                headers = headers + mapOf(
+                    "origin" to mainUrl,
+                    "referer" to "$mainUrl/"
+                ),
+                requestBody = body,
+                interceptor = interceptor,
+                timeout = 10000
+            )
+        } catch (e: Exception) {
+            // Best effort: không làm gián đoạn việc phát video nếu báo điểm thất bại
+        }
+    }
+
     private val prefs: SharedPreferences?
         get() {
             val activity = CommonActivity.activity ?: return null
@@ -301,6 +370,10 @@ class Anime47Provider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        // Mô phỏng "vào web là tự điểm danh": gọi 1 lần mỗi session, không chặn
+        // luồng tải trang chủ nếu điểm danh lỗi/chậm.
+        triggerDailyCheckinOnce()
+
         val url = "$apiBaseUrl${request.data}&page=$page"
 
         val response: ApiFilterResponse? = try {
@@ -474,6 +547,7 @@ class Anime47Provider : MainAPI() {
                             fetchApi("$apiBaseUrl/anime/watch/episode/$id?lang=vi")
 
                         val streams = watchResponse?.streams ?: return@async
+                        var episodeLoaded = false
 
                         for (stream in streams) {
                             val url = stream.url
@@ -493,7 +567,10 @@ class Anime47Provider : MainAPI() {
                                         referer = referer
                                     )
                                     hydraxLinks.forEach { callback(it) }
-                                    if (hydraxLinks.isNotEmpty()) loaded.set(true)
+                                    if (hydraxLinks.isNotEmpty()) {
+                                        loaded.set(true)
+                                        episodeLoaded = true
+                                    }
                                 } catch (e: Exception) {
                                     // bỏ qua lỗi riêng của HY, không chặn các server khác
                                 }
@@ -540,6 +617,7 @@ class Anime47Provider : MainAPI() {
 
                             callback(link)
                             loaded.set(true)
+                            episodeLoaded = true
 
                             stream.subtitles?.forEach { subtitle ->
                                 if (!subtitle.file.isNullOrBlank()) {
@@ -547,6 +625,12 @@ class Anime47Provider : MainAPI() {
                                     subtitleCallback(SubtitleFile(label, subtitle.file))
                                 }
                             }
+                        }
+
+                        // Báo "đã xem" lên hệ thống DCC chỉ khi thực sự lấy được ít nhất
+                        // 1 link phát cho episode này (tránh cộng điểm cho tập lỗi/rỗng).
+                        if (episodeLoaded) {
+                            markEpisodeWatched(id)
                         }
                     } catch (e: Exception) {
                         // bỏ qua lỗi từng episode riêng lẻ
@@ -734,4 +818,3 @@ class Anime47Provider : MainAPI() {
         val has_more: Boolean?
     )
 }
-  
