@@ -41,6 +41,8 @@ import javax.crypto.spec.SecretKeySpec
 
 object HydraxExtractor {
 
+    // mapper riêng cho object này: chỉ khởi tạo 1 lần duy nhất khi class được load (Kotlin
+    // "object" là singleton), nên chi phí khởi tạo ObjectMapper không lặp lại ở runtime.
     private val mapper = jacksonObjectMapper()
     private const val FRAGMENT_SIZE = 2097152L // 2 MiB, must match server-side chunking
     const val RELAY_HOST = "hydrax-relay.internal"
@@ -297,9 +299,16 @@ object HydraxInterceptor : Interceptor {
         }
     }
 
+    // HIỆU NĂNG: parseRange() chạy trên MỖI request Range mà player gửi (tức mỗi lần
+    // player yêu cầu một đoạn dữ liệu mới trong lúc phát/tua), nên có thể được gọi hàng
+    // trăm lần trong 1 phiên xem video. Regex trước đây được new/compile lại mỗi lần gọi
+    // — cùng vấn đề đã tối ưu ở Anime47Provider.cdnFixRegex. Đưa lên hằng số cấp object
+    // để chỉ biên dịch 1 lần cho toàn bộ vòng đời app.
+    private val rangeHeaderRegex = Regex("""bytes=(\d+)-(\d*)""")
+
     private fun parseRange(header: String?, totalSize: Long): Pair<Long, Long> {
         if (header == null) return 0L to (totalSize - 1)
-        val match = Regex("""bytes=(\d+)-(\d*)""").find(header) ?: return 0L to (totalSize - 1)
+        val match = rangeHeaderRegex.find(header) ?: return 0L to (totalSize - 1)
         val start = match.groupValues[1].toLongOrNull() ?: 0L
         val end = match.groupValues[2].toLongOrNull() ?: (totalSize - 1)
         return start to minOf(end, totalSize - 1)
@@ -577,4 +586,5 @@ object HydraxInterceptor : Interceptor {
     }
 }
   
+ 
  
