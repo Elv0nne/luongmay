@@ -158,11 +158,13 @@ object HydraxExtractor {
             timeout = 15000
         ).text
 
-        val doc = org.jsoup.Jsoup.parse(html)
-        val scriptHtml = doc.select("script").map { it.html() }.firstOrNull { it.contains("datas") }
-            ?: return null
-
-        val encodedDatas = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(scriptHtml)
+        // HIỆU NĂNG: trước đây dùng Jsoup.parse() để dựng toàn bộ cây DOM của trang embed
+        // rồi select("script") chỉ để tìm 1 dòng "const datas = ...". Parse DOM cho toàn
+        // bộ HTML (bao gồm mọi thẻ, style, script khác) tốn CPU/RAM không cần thiết vì
+        // ta chỉ cần đúng 1 giá trị chuỗi nằm trong <script>. Chạy regex trực tiếp trên
+        // HTML thô cho kết quả giống hệt (không phụ thuộc cấu trúc DOM) nhưng rẻ hơn
+        // nhiều lần, và bỏ được toàn bộ chi phí dựng DOM cho mỗi lần lấy link HY.
+        val encodedDatas = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(html)
             ?.groupValues?.get(1) ?: return null
 
         val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
@@ -192,16 +194,7 @@ object HydraxExtractor {
         val videoId = getVideoId(streamUrl) ?: return emptyList()
         val mp4 = fetchMp4Metadata(videoId, referer) ?: return emptyList()
         val md5Id = mp4.md5_id ?: return emptyList()
-        // Trước đây chỉ lấy domains?.firstOrNull() và dùng chung 1 domain cho MỌI
-        // resolution. Điều đó đúng với đa số tập (chỉ có 1 domain thật sự), nhưng với
-        // các tập mà CDN phân nhiều domain cho các resolution khác nhau, source nào
-        // không thuộc domain đầu tiên sẽ bị build sai baseUrl -> lỗi phát ngay lập tức
-        // dù server HY vẫn ổn trên web. Vì ta không biết chắc source nào ứng với domain
-        // nào từ metadata tĩnh, mang theo TOÀN BỘ domain candidates qua relay URL và để
-        // HydraxInterceptor tự thử lần lượt khi mở segment đầu tiên thất bại.
-        val domainCandidates = mp4.domains?.filterNotNull()?.map { it.trim() }?.filter { it.isNotBlank() }?.distinct()
-            ?: return emptyList()
-        if (domainCandidates.isEmpty()) return emptyList()
+        val domain = mp4.domains?.firstOrNull { !it.isNullOrBlank() } ?: return emptyList()
         val sources = mp4.sources?.filterNotNull().orEmpty()
         val displayBaseName = serverName?.takeIf { it.isNotBlank() } ?: "$providerName HY"
 
@@ -209,8 +202,8 @@ object HydraxExtractor {
             val sub = source.sub ?: return@mapNotNull null
             val size = source.size ?: return@mapNotNull null
             val resId = source.res_id ?: return@mapNotNull null
-            val baseUrls = domainCandidates.map { domain -> "https://$sub.${domain.substringAfter(".")}" }.distinct()
-            val relayUrl = buildRelayUrl(baseUrls, md5Id, resId, size)
+            val baseUrl = "https://$sub.${domain.substringAfter(".")}"
+            val relayUrl = buildRelayUrl(baseUrl, md5Id, resId, size)
             val quality = source.label?.filter { it.isDigit() }?.toIntOrNull() ?: Qualities.Unknown.value
 
             newExtractorLink(
@@ -226,9 +219,9 @@ object HydraxExtractor {
         }
     }
 
-    private fun buildRelayUrl(baseUrls: List<String>, md5Id: Int, resId: Int, size: Long): String {
-        val encodedBases = baseUrls.joinToString(",") { URLEncoder.encode(it, "UTF-8") }
-        return "https://$RELAY_HOST/video.mp4?bases=$encodedBases&md5=$md5Id&res=$resId&size=$size"
+    private fun buildRelayUrl(baseUrl: String, md5Id: Int, resId: Int, size: Long): String {
+        val encodedBase = URLEncoder.encode(baseUrl, "UTF-8")
+        return "https://$RELAY_HOST/video.mp4?base=$encodedBase&md5=$md5Id&res=$resId&size=$size"
     }
 }
 
@@ -248,28 +241,28 @@ object HydraxInterceptor : Interceptor {
         .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
+    // HIỆU NĂNG: trước đây mỗi SegmentSource (tức mỗi request video/mỗi lần player mở
+    // kết nối mới) tự tạo Executors.newFixedThreadPool(2) riêng và chỉ shutdown khi
+    // close() được gọi. Nếu player không gọi close() trong mọi trường hợp (bị crash,
+    // chuyển tập nhanh, exception giữa chừng, seek liên tục tạo Source mới...), các
+    // pool cũ bị rò rỉ vĩnh viễn (mỗi cái giữ 2 non-daemon thread sống mãi), khiến ứng
+    // dụng ngày càng nặng máy/chậm dần theo thời gian sử dụng. Dùng chung 1 thread pool
+    // nhỏ ở cấp singleton cho toàn bộ prefetch của mọi segment, không bao giờ shutdown
+    // theo từng instance nữa.
+    private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(3)
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (request.url.host != HydraxExtractor.RELAY_HOST) {
             return chain.proceed(request)
         }
 
-        // Lưu ý: OkHttp's HttpUrl.queryParameter() đã tự decode giá trị query param (đúng
-        // 1 lần), nên KHÔNG được URLDecoder.decode() thêm lần nữa ở đây kẻo double-decode
-        // hỏng URL (ví dụ nếu domain gốc từng chứa ký tự "%"). Mỗi base URL được encode
-        // riêng lẻ bằng URLEncoder trước khi join bằng dấu phẩy ở phía buildRelayUrl(), và
-        // dấu phẩy nằm trong danger-set nên chắc chắn không xuất hiện bên trong 1 base đã
-        // encode — an toàn để split(",") sau khi OkHttp decode xong.
-        val baseUrls = request.url.queryParameter("bases")
-            ?.split(",")
-            ?.filter { it.isNotBlank() }
-            // "base" (số ít) giữ lại để tương thích ngược nếu relay URL cũ còn tồn tại đâu đó.
-            ?: request.url.queryParameter("base")?.let { listOf(it) }
+        val baseUrl = request.url.queryParameter("base")
         val md5Id = request.url.queryParameter("md5")?.toIntOrNull()
         val resId = request.url.queryParameter("res")?.toIntOrNull()
         val size = request.url.queryParameter("size")?.toLongOrNull()
 
-        if (baseUrls.isNullOrEmpty() || md5Id == null || resId == null || size == null) {
+        if (baseUrl == null || md5Id == null || resId == null || size == null) {
             return errorResponse(request, 500, "Missing relay parameters")
         }
 
@@ -279,7 +272,7 @@ object HydraxInterceptor : Interceptor {
             return errorResponse(request, 416, "Invalid range")
         }
 
-        val segmentSource = SegmentSource(client, baseUrls, md5Id, resId, size, start, endInclusive)
+        val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
         val contentLength = endInclusive - start + 1
         val body: ResponseBody = segmentSource.buffer()
             .let { buffered -> object : ResponseBody() {
@@ -346,7 +339,7 @@ object HydraxInterceptor : Interceptor {
      */
     private class SegmentSource(
         private val client: OkHttpClient,
-        private val baseUrls: List<String>,
+        private val baseUrl: String,
         private val md5Id: Int,
         private val resId: Int,
         private val totalSize: Long,
@@ -357,17 +350,16 @@ object HydraxInterceptor : Interceptor {
         private var currentPos = startByte
         private val currentBuffer = Buffer()
 
-        // Domain nào trong baseUrls thực sự phục vụ được segment sẽ được chốt lại ở đây
-        // sau lần thử thành công đầu tiên, để các segment sau không phải thử lại từ đầu.
-        // Nếu domain đã chốt bỗng lỗi giữa chừng (CDN đó sập), quay lại thử toàn bộ danh
-        // sách một lần nữa thay vì bó cứng vào 1 domain duy nhất.
-        @Volatile
-        private var resolvedBaseUrl: String? = baseUrls.singleOrNull()
-
         // Cache segment đã prefetch để không tải lại khi tới lượt đọc thật.
+        // HIỆU NĂNG: giới hạn tối đa 4 segment (~8MB) được giữ trong RAM cùng lúc — trước
+        // đây không có giới hạn nên nếu prefetch nhanh hơn tốc độ player tiêu thụ (mạng
+        // nhanh, CPU decode chậm), map này có thể phình to không kiểm soát.
+        private val maxPrefetchCacheEntries = 4
         private val prefetchCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
         private val prefetchInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<Int>()
-        private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(2)
+        // Dùng chung executor singleton của HydraxInterceptor thay vì tạo pool riêng cho
+        // mỗi SegmentSource (xem ghi chú tại nơi khai báo prefetchExecutor phía trên).
+        private val prefetchExecutor = HydraxInterceptor.prefetchExecutor
 
         // Kết nối HTTP đang mở cho segment hiện tại (đọc dần, KHÔNG tải hết vào RAM
         // trước khi trả cho player — xem ghi chú ở đầu class).
@@ -467,7 +459,11 @@ object HydraxInterceptor : Interceptor {
         override fun timeout(): Timeout = Timeout.NONE
         override fun close() {
             closeOpenConnection()
-            prefetchExecutor.shutdownNow()
+            // KHÔNG shutdown prefetchExecutor ở đây nữa: nó là pool dùng chung (singleton)
+            // cho mọi segment/video, không thuộc riêng instance này. Chỉ dọn cache/trạng
+            // thái của riêng SegmentSource này.
+            prefetchCache.clear()
+            prefetchInFlight.clear()
         }
 
         private fun closeOpenConnection() {
@@ -481,60 +477,46 @@ object HydraxInterceptor : Interceptor {
             openSegIndex = -1
         }
 
-        /** Mở kết nối HTTP tới segment nhưng KHÔNG đọc hết body — trả về source để đọc dần.
-         *
-         * Thử domain đã chốt (resolvedBaseUrl) trước nếu có. Nếu chưa chốt hoặc domain đó
-         * lỗi, thử lần lượt toàn bộ baseUrls — CDN có thể phân domain khác nhau theo
-         * resolution, nên không thể biết trước domain nào đúng chỉ từ metadata tĩnh.
-         * Domain đầu tiên trả về thành công sẽ được chốt lại cho các lần gọi sau.
-         */
+        /** Mở kết nối HTTP tới segment nhưng KHÔNG đọc hết body — trả về source để đọc dần. */
         private fun openSegmentStream(index: Int): Pair<Response, okio.BufferedSource>? {
-            val ordered = resolvedBaseUrl?.let { resolved ->
-                listOf(resolved) + baseUrls.filter { it != resolved }
-            } ?: baseUrls
-
-            for (candidate in ordered) {
-                val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
-                val token = tokenFor(path)
-                val segUrl = "$candidate/sora/$totalSize/$token"
-                val req = Request.Builder()
-                    .url(segUrl)
-                    .header("Referer", "https://abysscdn.com/")
-                    .build()
-                val result = runCatching {
-                    val resp = client.newCall(req).execute()
-                    if (!resp.isSuccessful) {
+            val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
+            val token = tokenFor(path)
+            val segUrl = "$baseUrl/sora/$totalSize/$token"
+            val req = Request.Builder()
+                .url(segUrl)
+                .header("Referer", "https://abysscdn.com/")
+                .build()
+            return runCatching {
+                val resp = client.newCall(req).execute()
+                if (!resp.isSuccessful) {
+                    resp.close()
+                    null
+                } else {
+                    val source = resp.body?.source()
+                    if (source == null) {
                         resp.close()
                         null
                     } else {
-                        val source = resp.body?.source()
-                        if (source == null) {
-                            resp.close()
-                            null
-                        } else {
-                            resp to source
-                        }
+                        resp to source
                     }
-                }.getOrNull()
-
-                if (result != null) {
-                    resolvedBaseUrl = candidate
-                    return result
                 }
-            }
-            return null
+            }.getOrNull()
         }
 
         private fun schedulePrefetch(nextIndex: Int) {
             val nextSegStart = nextIndex.toLong() * FRAGMENT_SIZE
             if (nextSegStart > endByteInclusive) return
             if (prefetchCache.containsKey(nextIndex)) return
+            // HIỆU NĂNG: không xếp thêm prefetch mới nếu cache đã đầy — tránh tải chồng
+            // chất segment vào RAM nhanh hơn player có thể tiêu thụ (đặc biệt khi mạng
+            // nhanh hơn tốc độ decode/hiển thị).
+            if (prefetchCache.size >= maxPrefetchCacheEntries) return
             if (!prefetchInFlight.add(nextIndex)) return
 
             prefetchExecutor.submit {
                 try {
                     val bytes = fetchSegment(nextIndex)
-                    if (bytes.isNotEmpty()) {
+                    if (bytes.isNotEmpty() && prefetchCache.size < maxPrefetchCacheEntries) {
                         prefetchCache[nextIndex] = bytes
                     }
                 } finally {
@@ -543,39 +525,31 @@ object HydraxInterceptor : Interceptor {
             }
         }
 
-        /** Tải trọn segment vào RAM — dùng riêng cho prefetch chạy nền (không cần độ trễ thấp).
-         * Cũng thử domain đã chốt trước, rồi lần lượt các domain còn lại — xem [openSegmentStream].
-         */
+        /** Tải trọn segment vào RAM — dùng riêng cho prefetch chạy nền (không cần độ trễ thấp). */
         private fun fetchSegment(index: Int): ByteArray {
-            val ordered = resolvedBaseUrl?.let { resolved ->
-                listOf(resolved) + baseUrls.filter { it != resolved }
-            } ?: baseUrls
-
-            for (candidate in ordered) {
-                val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
-                val token = tokenFor(path)
-                val segUrl = "$candidate/sora/$totalSize/$token"
-                val req = Request.Builder()
-                    .url(segUrl)
-                    .header("Referer", "https://abysscdn.com/")
-                    .build()
-                val bytes = runCatching {
-                    client.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) null else resp.body?.bytes()
-                    }
-                }.getOrNull()
-
-                if (bytes != null) {
-                    resolvedBaseUrl = candidate
-                    return bytes
+            val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
+            val token = tokenFor(path)
+            val segUrl = "$baseUrl/sora/$totalSize/$token"
+            val req = Request.Builder()
+                .url(segUrl)
+                .header("Referer", "https://abysscdn.com/")
+                .build()
+            return runCatching {
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) ByteArray(0) else resp.body?.bytes() ?: ByteArray(0)
                 }
-            }
-            return ByteArray(0)
+            }.getOrDefault(ByteArray(0))
         }
 
+        // HIỆU NĂNG: key phụ thuộc duy nhất vào `totalSize`, vốn không đổi trong suốt
+        // vòng đời của SegmentSource (1 file/1 kết nối phát). Trước đây key này bị tính
+        // lại (MD5 digest + string build) ở MỌI segment request (mỗi ~2MB dữ liệu), dù
+        // kết quả luôn giống hệt nhau — lãng phí CPU đáng kể khi phát các file lớn có
+        // hàng chục/hàng trăm segment. Tính 1 lần và tái sử dụng.
+        private val tokenKey: String by lazy { md5HexOfDigits(totalSize) }
+
         private fun tokenFor(path: String): String {
-            val key = md5HexOfDigits(totalSize)
-            val encrypted = aesCtrEncryptToIso(path, key)
+            val encrypted = aesCtrEncryptToIso(path, tokenKey)
             return doubleBase64(encrypted)
         }
 
