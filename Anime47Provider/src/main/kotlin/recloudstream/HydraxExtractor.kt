@@ -327,10 +327,74 @@ object HydraxInterceptor : Interceptor {
         }
 
         val rangeHeader = request.header("Range")
-        val (start, endInclusive) = parseRange(rangeHeader, size)
-        if (start > endInclusive || start < 0) {
+
+        // BUG GỐC (chỉ lộ ra ở file lớn, vd 720p, không lộ ở file nhỏ vd 360p):
+        // Khi player KHÔNG gửi header Range (một số player, đặc biệt ExoPlayer trên
+        // Android TV khi mở lần đầu, gửi GET thường không kèm Range), code cũ trả
+        // contentLength = totalSize (toàn bộ file) với status 200 OK. Nghĩa là ta
+        // "hứa" trả cả file ngay, nhưng SegmentSource bên dưới vẫn phải tải tuần tự
+        // từng segment 2MB một qua Abyss (mở connection mới cho mỗi segment). Với file
+        // 360p nhỏ (~vài chục MB, ít segment) việc này còn kịp trong ngưỡng chờ của
+        // player. Với file 720p lớn hơn nhiều lần, tổng thời gian để "bắt đầu có đủ
+        // dữ liệu" vượt quá timeout nạp dữ liệu ban đầu của ExoPlayer trên TV -> lỗi.
+        // Trên web thì HTML5 <video> khoan dung hơn nhiều với việc chờ, hoặc trình
+        // duyệt tự phát Range request theo từng đoạn nên không bao giờ rơi vào path
+        // "hứa trả cả file 720p lớn cùng lúc" này.
+        //
+        // Sửa: LUÔN coi là có Range, kể cả khi player không gửi header Range. Nếu
+        // không có Range, ta tự giới hạn response ở đúng 1 segment (2MB) đầu tiên và
+        // trả 206 Partial Content thay vì hứa hẹn nguyên file. Đây là pattern chuẩn
+        // của pseudo-streaming proxy: luôn trả từng khúc nhỏ, để player tự follow-up
+        // bằng các Range request tiếp theo khi cần thêm dữ liệu — giống hệt cách các
+        // proxy HLS/progressive-download khác xử lý, và khớp với cách SegmentSource
+        // vốn đã hoạt động theo từng segment 2MB.
+        val (start, requestedEnd) = if (rangeHeader != null) {
+            parseRange(rangeHeader, size)
+        } else {
+            0L to minOf(FRAGMENT_SIZE - 1, size - 1)
+        }
+
+        // NGUYÊN NHÂN THẬT SỰ của "ERROR_CODE_IO_BAD_HTTP_STATUS (2004)" gặp trên TV,
+        // chỉ ở 1 phim/1 resolution cụ thể trong khi web (browser, player khác) vẫn
+        // phát HY bình thường: giá trị "size" lấy từ mp4.sources (metadata do trang
+        // embed Abyss trả) đôi khi KHÔNG khớp chính xác với dung lượng thật của file
+        // trên CDN cho đúng combo phim/tập/resolution đó (sai lệch dữ liệu phía nguồn,
+        // không phải lỗi logic chung — đây là lý do các phim/resolution khác vẫn ổn).
+        // ExoPlayer trên TV thường gửi Range dạng mở "bytes=<start>-" khi tiếp tục đọc
+        // hoặc seek; nếu <start> đã vượt quá "size" (mà interceptor tin là đúng), phép
+        // tính requestedEnd = size - 1 sẽ nhỏ hơn start. Code cũ coi đây là "Range
+        // không hợp lệ" và trả cứng 416 -> ExoPlayer nhận HTTP status lỗi -> đúng mã
+        // ERROR_CODE_IO_BAD_HTTP_STATUS (2004) trong ảnh lỗi. Nhưng vì "size" của ta có
+        // thể sai lệch với server thật, việc trả 416 ở đây là quá cứng nhắc — ta chỉ nên
+        // coi request thật sự vô lý (start âm) là lỗi; còn start >= size chỉ đơn giản là
+        // "không còn gì thêm để đọc", nên trả một response rỗng nhưng hợp lệ (206 với 0
+        // byte nếu player hiểu Content-Range, hoặc coi như đã hết luồng) thay vì 416 cứng,
+        // để tránh làm crash toàn bộ player chỉ vì lệch vài KB so với size khai báo.
+        if (start < 0) {
             return errorResponse(request, 416, "Invalid range")
         }
+
+        // Trường hợp start đã vượt quá "size" khai báo (do lệch metadata): không còn gì
+        // để đọc theo hiểu biết của ta, nhưng KHÔNG coi đây là lỗi cứng. Trả 206 với
+        // Content-Length = 0 và Content-Range khớp giá trị size đã biết — ExoPlayer hiểu
+        // đây là đã đọc hết luồng (EOF hợp lệ) thay vì một lỗi HTTP, nên không crash mà
+        // chỉ dừng phát tại đó (thường không xảy ra ở giữa phim vì lệch chỉ vài KB cuối).
+        if (start >= size) {
+            return Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(206)
+                .message("Partial Content")
+                .header("Accept-Ranges", "bytes")
+                .header("Content-Length", "0")
+                .header("Content-Range", "bytes */$size")
+                .body("".toResponseBody(null))
+                .build()
+        }
+
+        // Nếu requestedEnd < start (nhưng start vẫn hợp lệ, < size), clamp về đúng start
+        // để tránh contentLength âm — vẫn trả về ít nhất 1 phần dữ liệu hợp lý thay vì lỗi.
+        val endInclusive = if (requestedEnd < start) start else requestedEnd
 
         val segmentSource = SegmentSource(client, baseUrl, md5Id, resId, size, start, endInclusive)
         val contentLength = endInclusive - start + 1
@@ -348,13 +412,13 @@ object HydraxInterceptor : Interceptor {
             .header("Content-Length", contentLength.toString())
             .body(body)
 
-        return if (rangeHeader != null) {
-            builder.code(206).message("Partial Content")
-                .header("Content-Range", "bytes $start-$endInclusive/$size")
-                .build()
-        } else {
-            builder.code(200).message("OK").build()
-        }
+        // Luôn trả 206 + Content-Range khi ta tự cắt bớt dữ liệu (dù player có gửi
+        // Range hay không), vì contentLength ở đây không còn bằng totalSize nữa —
+        // trả 200 OK trong trường hợp đó sẽ khiến player hiểu nhầm đây là toàn bộ
+        // nội dung file (chỉ 2MB) thay vì một phần của file lớn hơn.
+        return builder.code(206).message("Partial Content")
+            .header("Content-Range", "bytes $start-$endInclusive/$size")
+            .build()
     }
 
     private fun parseRange(header: String?, totalSize: Long): Pair<Long, Long> {
