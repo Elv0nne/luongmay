@@ -34,12 +34,16 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.net.URL
+import java.net.URLEncoder
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 private val mapper: ObjectMapper = jacksonObjectMapper().apply {
@@ -205,7 +209,7 @@ class Anime47Provider : MainAPI() {
     }
 
     private fun mapSubtitleLabel(label: String): String {
-        val trimmedLower = label.trim().lowercase(java.util.Locale.ROOT)
+        val trimmedLower = label.trim().lowercase(Locale.ROOT)
         if (trimmedLower.isBlank()) return "Subtitle"
 
         for ((standardName, keywords) in subtitleLanguageMap) {
@@ -218,7 +222,7 @@ class Anime47Provider : MainAPI() {
         return if (trimmed.isNotEmpty()) {
             val firstChar = trimmed[0]
             val firstCharUpper = if (firstChar.isLowerCase()) {
-                firstChar.titlecase(java.util.Locale.ROOT)
+                firstChar.titlecase(Locale.ROOT)
             } else {
                 firstChar.toString()
             }
@@ -233,7 +237,15 @@ class Anime47Provider : MainAPI() {
         val minLen = packetSize * 3
         if (data.size < minLen) return -1
 
-        for (i in 0 until (data.size - minLen)) {
+        // SỬA LỖI (off-by-one): giới hạn trên phải là "data.size - minLen" bao gồm cả vị
+        // trí cuối cùng còn đủ chỗ cho 3 gói 188 byte liên tiếp, tức index i thoả
+        // i + minLen <= data.size  =>  i <= data.size - minLen. Bản gốc dùng
+        // "0 until (data.size - minLen)" (loại trừ chặn trên) nên bỏ sót đúng vị trí i =
+        // data.size - minLen — trường hợp dễ gặp nhất là khi offset hợp lệ nằm ở cuối
+        // buffer (ví dụ data.size đúng bằng minLen, tức chỉ có duy nhất 1 vị trí hợp lệ
+        // là i = 0), khiến hàm trả về -1 (không sửa được offset) dù dữ liệu hợp lệ.
+        val lastValidIndex = data.size - minLen
+        for (i in 0..lastValidIndex) {
             if (data[i] == 0x47.toByte() &&
                 data[i + packetSize] == 0x47.toByte() &&
                 data[i + packetSize * 2] == 0x47.toByte()
@@ -251,7 +263,7 @@ class Anime47Provider : MainAPI() {
     // cài đặt đăng nhập lại. Sửa: khi phát hiện token cũ không còn dùng được, tự động
     // login lại bằng email/password đã lưu (forceRefresh = true), hoàn toàn trong nền,
     // và chỉ retry request một lần thay vì bắt người dùng thao tác thủ công.
-    private val tokenMutex = kotlinx.coroutines.sync.Mutex()
+    private val tokenMutex = Mutex()
 
     private suspend fun ensureToken(forceRefresh: Boolean = false): String? {
         if (!forceRefresh) {
@@ -402,7 +414,7 @@ class Anime47Provider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encoded = java.net.URLEncoder.encode(query, "UTF-8")
+        val encoded = URLEncoder.encode(query, "UTF-8")
         val url = "$apiBaseUrl/search/full/?lang=vi&keyword=$encoded&page=1"
 
         val response: ApiSearchResponse? = try {
@@ -597,7 +609,7 @@ class Anime47Provider : MainAPI() {
                             if (url.contains("vlogphim.net")) {
                                 headers["Origin"] = referer
                                 try {
-                                    val host = java.net.URL(url).host
+                                    val host = URL(url).host
                                     headers["authority"] = host
                                 } catch (e: Exception) {
                                     headers["authority"] = "pl.vlogphim.net"
@@ -833,4 +845,5 @@ class Anime47Provider : MainAPI() {
         val has_more: Boolean?
     )
 }
+ 
  
