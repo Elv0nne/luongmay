@@ -162,7 +162,11 @@ object HydraxExtractor {
         val scriptHtml = doc.select("script").map { it.html() }.firstOrNull { it.contains("datas") }
             ?: return null
 
-        val encodedDatas = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(scriptHtml)
+        // Một số tập/lần render trả về script với biến khai báo bằng "let"/"var" thay vì
+        // "const", hoặc dùng nháy đơn thay vì nháy kép — regex cũ chỉ khớp đúng 1 biến thể
+        // ("const datas = \"...\"") nên các trường hợp khác im lặng trả về null (không log
+        // lỗi gì), đúng kiểu "load ra 0 link, màn hình đen ngay" mà không rõ lý do.
+        val encodedDatas = Regex("""(?:const|let|var)\s+datas\s*=\s*["']([^"']*)["']""").find(scriptHtml)
             ?.groupValues?.get(1) ?: return null
 
         val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
@@ -192,15 +196,40 @@ object HydraxExtractor {
         val videoId = getVideoId(streamUrl) ?: return emptyList()
         val mp4 = fetchMp4Metadata(videoId, referer) ?: return emptyList()
         val md5Id = mp4.md5_id ?: return emptyList()
-        val domain = mp4.domains?.firstOrNull { !it.isNullOrBlank() } ?: return emptyList()
+
+        // Trước đây chỉ lấy domain ĐẦU TIÊN không rỗng trong mp4.domains rồi dùng cho mọi
+        // source. Abyss/Hydrax trả về nhiều domain xoay vòng theo CDN/tập; nếu domain đầu
+        // tiên đang die/quá tải cho đúng tập đó thì toàn bộ link server HY của tập đó hỏng,
+        // trong khi các tập khác (rơi vào domain khác hoặc domain đầu vẫn sống) thì bình
+        // thường — đúng khớp triệu chứng "chỉ 1 vài tập lỗi, các tập khác coi được".
+        // Giờ giữ lại toàn bộ danh sách domain hợp lệ để có thể fallback.
+        val candidateDomains = mp4.domains?.mapNotNull { it?.takeIf(String::isNotBlank) }.orEmpty()
+        if (candidateDomains.isEmpty()) return emptyList()
+
         val sources = mp4.sources?.filterNotNull().orEmpty()
         val displayBaseName = serverName?.takeIf { it.isNotBlank() } ?: "$providerName HY"
+
+        // Domain đầu tiên trong mp4.domains đôi khi đang die/quá tải riêng cho tập đó
+        // (Abyss xoay vòng CDN theo tập/tải), trong khi các domain còn lại trong cùng
+        // danh sách vẫn sống. Trước đây code luôn lấy domain[0] không cần biết sống hay
+        // chết -> đúng những tập rơi vào domain chết sẽ luôn lỗi "load 0 link" dù các
+        // tập khác (rơi vào domain khác) bình thường. Giờ thử HEAD nhanh từng domain
+        // (dùng sub của source đầu tiên làm đại diện) và chọn domain đầu tiên phản hồi.
+        val workingRootDomain = pickWorkingDomain(candidateDomains, sources.firstOrNull()?.sub, referer)
+            ?: rootDomain(candidateDomains.first())
 
         return sources.mapNotNull { source ->
             val sub = source.sub ?: return@mapNotNull null
             val size = source.size ?: return@mapNotNull null
             val resId = source.res_id ?: return@mapNotNull null
-            val baseUrl = "https://$sub.${domain.substringAfter(".")}"
+
+            // Domain thật để ghép với "sub" phải là root domain (2 nhãn cuối, vd "abysscdn.com"),
+            // không phải "mọi thứ sau dấu chấm đầu tiên". Bản cũ dùng substringAfter(".") nên
+            // với domain dạng "cdn.abysscdn.com" sẽ cắt còn "abysscdn.com" (đúng), nhưng với
+            // domain dạng ngắn hơn như "abysscdn.net" (chỉ 2 nhãn) lại cắt còn mỗi "net" rồi
+            // ghép "sub1.net" — sai hoàn toàn, tạo ra host không tồn tại -> tập đó luôn lỗi dù
+            // metadata lấy thành công. rootDomain() xử lý đúng cả 2 trường hợp.
+            val baseUrl = "https://$sub.$workingRootDomain"
             val relayUrl = buildRelayUrl(baseUrl, md5Id, resId, size)
             val quality = source.label?.filter { it.isDigit() }?.toIntOrNull() ?: Qualities.Unknown.value
 
@@ -215,6 +244,49 @@ object HydraxExtractor {
                 this.headers = mapOf("Referer" to referer)
             }
         }
+    }
+
+    /**
+     * Lấy "root domain" (2 nhãn cuối, vd "abysscdn.com") từ một domain có thể có sẵn
+     * subdomain (vd "cdn3.abysscdn.com"). Bản cũ dùng substringAfter(".") vốn giả định
+     * domain luôn có >= 3 nhãn; nếu domain chỉ có 2 nhãn (vd "abysscdn.net") thì cắt sai,
+     * mất luôn nhãn chính. Hàm này lấy đúng 2 nhãn cuối bất kể domain có bao nhiêu nhãn.
+     */
+    private fun rootDomain(domain: String): String {
+        val labels = domain.split(".")
+        return if (labels.size >= 2) labels.takeLast(2).joinToString(".") else domain
+    }
+
+    /**
+     * Thử lần lượt các domain ứng viên (root domain, ghép với "sub" của source đầu tiên
+     * làm đại diện) và trả về root domain đầu tiên mà DNS/kết nối TCP-TLS tới được.
+     *
+     * Lưu ý quan trọng: "$sub.$root/" không phải endpoint thật của Abyss (endpoint thật
+     * là "/sora/{size}/{token}" với token mã hoá riêng cho từng segment — không thể dựng
+     * trước ở bước này), nên response gần như chắc chắn là 404/4xx kể cả với domain đang
+     * sống bình thường. Vì vậy ta KHÔNG dùng resp.isSuccessful (2xx/3xx) để đánh giá —
+     * làm vậy sẽ luôn fail và khiến probe này vô dụng. Thay vào đó, chỉ cần request không
+     * ném exception (timeout, "Unable to resolve host", connection refused, v.v.) là đủ
+     * để coi domain đó "còn sống" ở tầng mạng; bất kỳ HTTP status nào trả về (kể cả 404)
+     * đều chứng minh domain có DNS + server đang chạy.
+     */
+    private suspend fun pickWorkingDomain(domains: List<String>, sampleSub: String?, referer: String): String? {
+        val sub = sampleSub ?: return null
+        val roots = domains.map { rootDomain(it) }.distinct()
+        if (roots.size <= 1) return roots.firstOrNull()
+
+        for (root in roots) {
+            val reachable = runCatching {
+                app.get(
+                    "https://$sub.$root/",
+                    headers = mapOf("Referer" to referer),
+                    timeout = 4000
+                )
+                true // không ném exception nghĩa là đã kết nối + nhận được response (bất kể status)
+            }.getOrDefault(false)
+            if (reachable) return root
+        }
+        return null
     }
 
     private fun buildRelayUrl(baseUrl: String, md5Id: Int, resId: Int, size: Long): String {
@@ -545,3 +617,4 @@ object HydraxInterceptor : Interceptor {
     }
 }
   
+ 
