@@ -518,27 +518,6 @@ class Anime47Provider : MainAPI() {
         }
     }
 
-    // ===================== Server detection & thứ tự hiển thị (FE / HY / vlogphim...) =====================
-
-    // BUG cũ: chỉ nhận diện HY (Hydrax/Abyss) qua domain (HydraxExtractor.HY_HOSTS).
-    // Nếu Anime47 đổi/thêm domain embed HY mà danh sách host chưa cập nhật kịp,
-    // isHydraxUrl() trả về false dù server_name vẫn là "HY" -> stream bị rơi nhầm vào
-    // nhánh coi url là m3u8 phát trực tiếp, trong khi thực chất đó là trang embed HTML
-    // (không phải m3u8) nên phát sẽ lỗi. Nhận diện thêm qua server_name == "HY" do API
-    // trả về để không phụ thuộc hoàn toàn vào domain.
-    private fun isHydraxStream(url: String, serverName: String?): Boolean {
-        if (HydraxExtractor.isHydraxUrl(url)) return true
-        return serverName?.trim()?.equals("HY", ignoreCase = true) == true
-    }
-
-    // Thứ tự hiển thị server cho người xem: FE (m3u8 trực tiếp, tải nhanh, ổn định)
-    // ưu tiên trước; HY (Hydrax/Abyss, phải giải mã AES + relay nên chậm và dễ lỗi hơn)
-    // xếp sau. sortedBy là stable sort nên các server cùng nhóm ưu tiên vẫn giữ nguyên
-    // thứ tự tương đối như API trả về (không xáo trộn thêm ngoài việc tách 2 nhóm).
-    private fun serverSortPriority(stream: Stream): Int {
-        return if (isHydraxStream(stream.url.orEmpty(), stream.server_name)) 1 else 0
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -570,13 +549,7 @@ class Anime47Provider : MainAPI() {
                         val streams = watchResponse?.streams ?: return@async
                         var episodeLoaded = false
 
-                        // FE (m3u8 trực tiếp) hiển thị trước, HY (Hydrax) hiển thị sau -
-                        // xem serverSortPriority(). Trước đây duyệt theo đúng thứ tự API trả
-                        // về nên thứ tự server hiển thị cho người xem không ổn định/không ưu
-                        // tiên được server nào.
-                        val sortedStreams = streams.sortedBy { serverSortPriority(it) }
-
-                        for (stream in sortedStreams) {
+                        for (stream in streams) {
                             val url = stream.url
                             val serverName = stream.server_name
 
@@ -585,7 +558,7 @@ class Anime47Provider : MainAPI() {
                             // Server "HY" (Hydrax/Abyss.to) không trả về m3u8 thật, mà là một trang
                             // embed chứa metadata mã hóa AES-CTR (xem HydraxExtractor.kt). Phải đi
                             // qua HydraxExtractor + HydraxInterceptor thay vì coi url là m3u8 trực tiếp.
-                            if (isHydraxStream(url, serverName)) {
+                            if (HydraxExtractor.isHydraxUrl(url)) {
                                 try {
                                     val hydraxLinks = HydraxExtractor.getLinks(
                                         streamUrl = url,
@@ -622,11 +595,7 @@ class Anime47Provider : MainAPI() {
                             )
 
                             if (url.contains("vlogphim.net")) {
-                                // BUG cũ: gán Origin = referer ("$mainUrl/") - Origin header đúng
-                                // chuẩn không được có path/trailing slash như Referer, chỉ gồm
-                                // scheme + host. Một số CDN kiểm tra Origin nghiêm ngặt có thể
-                                // từ chối request vì giá trị sai định dạng này.
-                                headers["Origin"] = mainUrl
+                                headers["Origin"] = referer
                                 try {
                                     val host = java.net.URL(url).host
                                     headers["authority"] = host
@@ -635,21 +604,11 @@ class Anime47Provider : MainAPI() {
                                 }
                             }
 
-                            // BUG cũ: gán cứng ExtractorLinkType.M3U8 cho MỌI server ngoài HY,
-                            // kể cả khi url thực chất là .mp4 trực tiếp -> player nhận sai kiểu
-                            // stream (tưởng HLS) và có thể phát lỗi/không chạy. Suy ra type theo
-                            // đuôi url thay vì gán cứng một loại cho tất cả.
-                            val linkType = if (url.contains(".m3u8", ignoreCase = true)) {
-                                ExtractorLinkType.M3U8
-                            } else {
-                                ExtractorLinkType.VIDEO
-                            }
-
                             val link = newExtractorLink(
                                 this@Anime47Provider.name,
                                 serverName ?: this@Anime47Provider.name,
                                 url,
-                                linkType
+                                ExtractorLinkType.M3U8
                             ) {
                                 this.referer = referer
                                 this.headers = headers
@@ -697,26 +656,41 @@ class Anime47Provider : MainAPI() {
             return HydraxInterceptor
         }
 
-        val cdnRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
-
+        // HIỆU NĂNG: regex/interceptor CDN "nonprofit.asia" chỉ thực sự cần thiết cho các
+        // link không phải Hydrax. Dùng cdnFixRegex ở cấp companion (biên dịch 1 lần duy
+        // nhất khi class được load) thay vì tạo Regex mới mỗi lần getVideoInterceptor()
+        // được gọi (tức mỗi ExtractorLink của mỗi tập/mỗi server) — tránh chi phí compile
+        // regex lặp lại không cần thiết.
         return Interceptor { chain ->
             val request = chain.request()
             val response = chain.proceed(request)
 
-            if (!cdnRegex.containsMatchIn(request.url.toString())) {
+            if (!cdnFixRegex.containsMatchIn(request.url.toString())) {
                 return@Interceptor response
             }
 
             val body = response.body ?: return@Interceptor response
-            val bytes = body.bytes()
-            val offset = findMpegTsOffset(bytes)
 
-            val fixedBytes = if (offset > 0) bytes.copyOfRange(offset, bytes.size) else bytes
+            try {
+                val bytes = body.bytes()
+                val offset = findMpegTsOffset(bytes)
+                val fixedBytes = if (offset > 0) bytes.copyOfRange(offset, bytes.size) else bytes
 
-            response.newBuilder()
-                .body(fixedBytes.toResponseBody(body.contentType()))
-                .build()
+                response.newBuilder()
+                    .body(fixedBytes.toResponseBody(body.contentType()))
+                    .build()
+            } catch (e: IOException) {
+                // Đọc body thất bại giữa chừng (mạng gián đoạn): trả lỗi gốc cho player
+                // xử lý (retry/next server) thay vì làm crash luồng phát video.
+                response
+            }
         }
+    }
+
+    private companion object {
+        // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
+        // getVideoInterceptor().
+        val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
     }
     // ===================== Data classes (API models) =====================
 
