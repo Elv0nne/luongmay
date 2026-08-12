@@ -162,11 +162,7 @@ object HydraxExtractor {
         val scriptHtml = doc.select("script").map { it.html() }.firstOrNull { it.contains("datas") }
             ?: return null
 
-        // Một số tập/lần render trả về script với biến khai báo bằng "let"/"var" thay vì
-        // "const", hoặc dùng nháy đơn thay vì nháy kép — regex cũ chỉ khớp đúng 1 biến thể
-        // ("const datas = \"...\"") nên các trường hợp khác im lặng trả về null (không log
-        // lỗi gì), đúng kiểu "load ra 0 link, màn hình đen ngay" mà không rõ lý do.
-        val encodedDatas = Regex("""(?:const|let|var)\s+datas\s*=\s*["']([^"']*)["']""").find(scriptHtml)
+        val encodedDatas = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(scriptHtml)
             ?.groupValues?.get(1) ?: return null
 
         val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
@@ -196,16 +192,16 @@ object HydraxExtractor {
         val videoId = getVideoId(streamUrl) ?: return emptyList()
         val mp4 = fetchMp4Metadata(videoId, referer) ?: return emptyList()
         val md5Id = mp4.md5_id ?: return emptyList()
-
-        // Trước đây chỉ lấy domain ĐẦU TIÊN không rỗng trong mp4.domains rồi dùng cho mọi
-        // source. Abyss/Hydrax trả về nhiều domain xoay vòng theo CDN/tập; nếu domain đầu
-        // tiên đang die/quá tải cho đúng tập đó thì toàn bộ link server HY của tập đó hỏng,
-        // trong khi các tập khác (rơi vào domain khác hoặc domain đầu vẫn sống) thì bình
-        // thường — đúng khớp triệu chứng "chỉ 1 vài tập lỗi, các tập khác coi được".
-        // Giờ giữ lại toàn bộ danh sách domain hợp lệ để có thể fallback.
-        val candidateDomains = mp4.domains?.mapNotNull { it?.takeIf(String::isNotBlank) }.orEmpty()
-        if (candidateDomains.isEmpty()) return emptyList()
-
+        // Trước đây chỉ lấy domains?.firstOrNull() và dùng chung 1 domain cho MỌI
+        // resolution. Điều đó đúng với đa số tập (chỉ có 1 domain thật sự), nhưng với
+        // các tập mà CDN phân nhiều domain cho các resolution khác nhau, source nào
+        // không thuộc domain đầu tiên sẽ bị build sai baseUrl -> lỗi phát ngay lập tức
+        // dù server HY vẫn ổn trên web. Vì ta không biết chắc source nào ứng với domain
+        // nào từ metadata tĩnh, mang theo TOÀN BỘ domain candidates qua relay URL và để
+        // HydraxInterceptor tự thử lần lượt khi mở segment đầu tiên thất bại.
+        val domainCandidates = mp4.domains?.filterNotNull()?.map { it.trim() }?.filter { it.isNotBlank() }?.distinct()
+            ?: return emptyList()
+        if (domainCandidates.isEmpty()) return emptyList()
         val sources = mp4.sources?.filterNotNull().orEmpty()
         val displayBaseName = serverName?.takeIf { it.isNotBlank() } ?: "$providerName HY"
 
@@ -213,23 +209,7 @@ object HydraxExtractor {
             val sub = source.sub ?: return@mapNotNull null
             val size = source.size ?: return@mapNotNull null
             val resId = source.res_id ?: return@mapNotNull null
-
-            // Domain thật để ghép với "sub" phải là root domain (2 nhãn cuối, vd "abysscdn.com"),
-            // không phải "mọi thứ sau dấu chấm đầu tiên". Bản cũ dùng substringAfter(".") nên
-            // với domain dạng "cdn.abysscdn.com" sẽ cắt còn "abysscdn.com" (đúng), nhưng với
-            // domain dạng ngắn hơn như "abysscdn.net" (chỉ 2 nhãn) lại cắt còn mỗi "net" rồi
-            // ghép "sub1.net" — sai hoàn toàn, tạo ra host không tồn tại -> tập đó luôn lỗi dù
-            // metadata lấy thành công. rootDomain() xử lý đúng cả 2 trường hợp.
-            //
-            // QUAN TRỌNG: thay vì đoán trước 1 domain "sống" (không đáng tin cậy — xem ghi
-            // chú cũ ở pickWorkingDomain, vốn chỉ test path gốc "/" chứ không phải endpoint
-            // thật "/sora/...", nên không phát hiện được lỗi tầng ứng dụng như trang lỗi CDN
-            // trả về status 200 kèm HTML), giờ ta nhúng TOÀN BỘ danh sách root domain vào
-            // relay URL. SegmentSource sẽ tự thử lần lượt từng domain thật sự tại đúng
-            // endpoint /sora/ khi tải segment, và tự chuyển sang domain kế tiếp nếu domain
-            // hiện tại trả về lỗi kết nối HOẶC nội dung không phải video (content-type sai).
-            val allRootDomains = candidateDomains.map { rootDomain(it) }.distinct()
-            val baseUrls = allRootDomains.map { root -> "https://$sub.$root" }
+            val baseUrls = domainCandidates.map { domain -> "https://$sub.${domain.substringAfter(".")}" }.distinct()
             val relayUrl = buildRelayUrl(baseUrls, md5Id, resId, size)
             val quality = source.label?.filter { it.isDigit() }?.toIntOrNull() ?: Qualities.Unknown.value
 
@@ -246,24 +226,8 @@ object HydraxExtractor {
         }
     }
 
-    /**
-     * Lấy "root domain" (2 nhãn cuối, vd "abysscdn.com") từ một domain có thể có sẵn
-     * subdomain (vd "cdn3.abysscdn.com"). Bản cũ dùng substringAfter(".") vốn giả định
-     * domain luôn có >= 3 nhãn; nếu domain chỉ có 2 nhãn (vd "abysscdn.net") thì cắt sai,
-     * mất luôn nhãn chính. Hàm này lấy đúng 2 nhãn cuối bất kể domain có bao nhiêu nhãn.
-     */
-    private fun rootDomain(domain: String): String {
-        val labels = domain.split(".")
-        return if (labels.size >= 2) labels.takeLast(2).joinToString(".") else domain
-    }
-
     private fun buildRelayUrl(baseUrls: List<String>, md5Id: Int, resId: Int, size: Long): String {
-        // Nhúng TOÀN BỘ danh sách domain ứng viên (không chỉ 1 domain đã "đoán" trước) để
-        // SegmentSource có thể tự fallback qua domain kế tiếp khi domain hiện tại lỗi thật
-        // sự tại endpoint /sora/ (kết nối lỗi hoặc trả về nội dung không phải video).
-        // Dùng "|" làm dấu phân tách vì baseUrl (dạng "https://sub.domain.com") không thể
-        // chứa ký tự này, tránh nhầm lẫn với dấu phẩy có thể xuất hiện sau URL-encode.
-        val encodedBases = baseUrls.joinToString("|") { URLEncoder.encode(it, "UTF-8") }
+        val encodedBases = baseUrls.joinToString(",") { URLEncoder.encode(it, "UTF-8") }
         return "https://$RELAY_HOST/video.mp4?bases=$encodedBases&md5=$md5Id&res=$resId&size=$size"
     }
 }
@@ -290,91 +254,30 @@ object HydraxInterceptor : Interceptor {
             return chain.proceed(request)
         }
 
-        // "bases" thay cho "base" cũ: chứa TOÀN BỘ danh sách domain ứng viên (phân tách
-        // bằng "|", đã URL-encode từng phần) thay vì chỉ 1 domain "đoán" sẵn — cho phép
-        // SegmentSource tự fallback qua domain kế tiếp khi domain hiện tại lỗi thật sự.
+        // Lưu ý: OkHttp's HttpUrl.queryParameter() đã tự decode giá trị query param (đúng
+        // 1 lần), nên KHÔNG được URLDecoder.decode() thêm lần nữa ở đây kẻo double-decode
+        // hỏng URL (ví dụ nếu domain gốc từng chứa ký tự "%"). Mỗi base URL được encode
+        // riêng lẻ bằng URLEncoder trước khi join bằng dấu phẩy ở phía buildRelayUrl(), và
+        // dấu phẩy nằm trong danger-set nên chắc chắn không xuất hiện bên trong 1 base đã
+        // encode — an toàn để split(",") sau khi OkHttp decode xong.
         val baseUrls = request.url.queryParameter("bases")
-            ?.split("|")
-            ?.mapNotNull { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrNull() }
+            ?.split(",")
             ?.filter { it.isNotBlank() }
-            .orEmpty()
+            // "base" (số ít) giữ lại để tương thích ngược nếu relay URL cũ còn tồn tại đâu đó.
+            ?: request.url.queryParameter("base")?.let { listOf(it) }
         val md5Id = request.url.queryParameter("md5")?.toIntOrNull()
         val resId = request.url.queryParameter("res")?.toIntOrNull()
         val size = request.url.queryParameter("size")?.toLongOrNull()
 
-        if (baseUrls.isEmpty() || md5Id == null || resId == null || size == null) {
+        if (baseUrls.isNullOrEmpty() || md5Id == null || resId == null || size == null) {
             return errorResponse(request, 500, "Missing relay parameters")
         }
 
         val rangeHeader = request.header("Range")
-
-        // BUG GỐC (chỉ lộ ra ở file lớn, vd 720p, không lộ ở file nhỏ vd 360p):
-        // Khi player KHÔNG gửi header Range (một số player, đặc biệt ExoPlayer trên
-        // Android TV khi mở lần đầu, gửi GET thường không kèm Range), code cũ trả
-        // contentLength = totalSize (toàn bộ file) với status 200 OK. Nghĩa là ta
-        // "hứa" trả cả file ngay, nhưng SegmentSource bên dưới vẫn phải tải tuần tự
-        // từng segment 2MB một qua Abyss (mở connection mới cho mỗi segment). Với file
-        // 360p nhỏ (~vài chục MB, ít segment) việc này còn kịp trong ngưỡng chờ của
-        // player. Với file 720p lớn hơn nhiều lần, tổng thời gian để "bắt đầu có đủ
-        // dữ liệu" vượt quá timeout nạp dữ liệu ban đầu của ExoPlayer trên TV -> lỗi.
-        // Trên web thì HTML5 <video> khoan dung hơn nhiều với việc chờ, hoặc trình
-        // duyệt tự phát Range request theo từng đoạn nên không bao giờ rơi vào path
-        // "hứa trả cả file 720p lớn cùng lúc" này.
-        //
-        // Sửa: LUÔN coi là có Range, kể cả khi player không gửi header Range. Nếu
-        // không có Range, ta tự giới hạn response ở đúng 1 segment (2MB) đầu tiên và
-        // trả 206 Partial Content thay vì hứa hẹn nguyên file. Đây là pattern chuẩn
-        // của pseudo-streaming proxy: luôn trả từng khúc nhỏ, để player tự follow-up
-        // bằng các Range request tiếp theo khi cần thêm dữ liệu — giống hệt cách các
-        // proxy HLS/progressive-download khác xử lý, và khớp với cách SegmentSource
-        // vốn đã hoạt động theo từng segment 2MB.
-        val (start, requestedEnd) = if (rangeHeader != null) {
-            parseRange(rangeHeader, size)
-        } else {
-            0L to minOf(FRAGMENT_SIZE - 1, size - 1)
-        }
-
-        // NGUYÊN NHÂN THẬT SỰ của "ERROR_CODE_IO_BAD_HTTP_STATUS (2004)" gặp trên TV,
-        // chỉ ở 1 phim/1 resolution cụ thể trong khi web (browser, player khác) vẫn
-        // phát HY bình thường: giá trị "size" lấy từ mp4.sources (metadata do trang
-        // embed Abyss trả) đôi khi KHÔNG khớp chính xác với dung lượng thật của file
-        // trên CDN cho đúng combo phim/tập/resolution đó (sai lệch dữ liệu phía nguồn,
-        // không phải lỗi logic chung — đây là lý do các phim/resolution khác vẫn ổn).
-        // ExoPlayer trên TV thường gửi Range dạng mở "bytes=<start>-" khi tiếp tục đọc
-        // hoặc seek; nếu <start> đã vượt quá "size" (mà interceptor tin là đúng), phép
-        // tính requestedEnd = size - 1 sẽ nhỏ hơn start. Code cũ coi đây là "Range
-        // không hợp lệ" và trả cứng 416 -> ExoPlayer nhận HTTP status lỗi -> đúng mã
-        // ERROR_CODE_IO_BAD_HTTP_STATUS (2004) trong ảnh lỗi. Nhưng vì "size" của ta có
-        // thể sai lệch với server thật, việc trả 416 ở đây là quá cứng nhắc — ta chỉ nên
-        // coi request thật sự vô lý (start âm) là lỗi; còn start >= size chỉ đơn giản là
-        // "không còn gì thêm để đọc", nên trả một response rỗng nhưng hợp lệ (206 với 0
-        // byte nếu player hiểu Content-Range, hoặc coi như đã hết luồng) thay vì 416 cứng,
-        // để tránh làm crash toàn bộ player chỉ vì lệch vài KB so với size khai báo.
-        if (start < 0) {
+        val (start, endInclusive) = parseRange(rangeHeader, size)
+        if (start > endInclusive || start < 0) {
             return errorResponse(request, 416, "Invalid range")
         }
-
-        // Trường hợp start đã vượt quá "size" khai báo (do lệch metadata): không còn gì
-        // để đọc theo hiểu biết của ta, nhưng KHÔNG coi đây là lỗi cứng. Trả 206 với
-        // Content-Length = 0 và Content-Range khớp giá trị size đã biết — ExoPlayer hiểu
-        // đây là đã đọc hết luồng (EOF hợp lệ) thay vì một lỗi HTTP, nên không crash mà
-        // chỉ dừng phát tại đó (thường không xảy ra ở giữa phim vì lệch chỉ vài KB cuối).
-        if (start >= size) {
-            return Response.Builder()
-                .request(request)
-                .protocol(Protocol.HTTP_1_1)
-                .code(206)
-                .message("Partial Content")
-                .header("Accept-Ranges", "bytes")
-                .header("Content-Length", "0")
-                .header("Content-Range", "bytes */$size")
-                .body("".toResponseBody(null))
-                .build()
-        }
-
-        // Nếu requestedEnd < start (nhưng start vẫn hợp lệ, < size), clamp về đúng start
-        // để tránh contentLength âm — vẫn trả về ít nhất 1 phần dữ liệu hợp lý thay vì lỗi.
-        val endInclusive = if (requestedEnd < start) start else requestedEnd
 
         val segmentSource = SegmentSource(client, baseUrls, md5Id, resId, size, start, endInclusive)
         val contentLength = endInclusive - start + 1
@@ -392,13 +295,13 @@ object HydraxInterceptor : Interceptor {
             .header("Content-Length", contentLength.toString())
             .body(body)
 
-        // Luôn trả 206 + Content-Range khi ta tự cắt bớt dữ liệu (dù player có gửi
-        // Range hay không), vì contentLength ở đây không còn bằng totalSize nữa —
-        // trả 200 OK trong trường hợp đó sẽ khiến player hiểu nhầm đây là toàn bộ
-        // nội dung file (chỉ 2MB) thay vì một phần của file lớn hơn.
-        return builder.code(206).message("Partial Content")
-            .header("Content-Range", "bytes $start-$endInclusive/$size")
-            .build()
+        return if (rangeHeader != null) {
+            builder.code(206).message("Partial Content")
+                .header("Content-Range", "bytes $start-$endInclusive/$size")
+                .build()
+        } else {
+            builder.code(200).message("OK").build()
+        }
     }
 
     private fun parseRange(header: String?, totalSize: Long): Pair<Long, Long> {
@@ -454,12 +357,12 @@ object HydraxInterceptor : Interceptor {
         private var currentPos = startByte
         private val currentBuffer = Buffer()
 
-        // Domain đang được dùng để tải segment. Bắt đầu ở domain đầu tiên trong danh sách;
-        // sẽ tự động chuyển sang domain kế tiếp nếu domain hiện tại liên tục lỗi (xem
-        // openSegmentStream/fetchSegment). Giữ nguyên qua các lần đọc để tránh phải dò lại
-        // từ đầu domain[0] cho mỗi segment một khi đã biết nó lỗi.
+        // Domain nào trong baseUrls thực sự phục vụ được segment sẽ được chốt lại ở đây
+        // sau lần thử thành công đầu tiên, để các segment sau không phải thử lại từ đầu.
+        // Nếu domain đã chốt bỗng lỗi giữa chừng (CDN đó sập), quay lại thử toàn bộ danh
+        // sách một lần nữa thay vì bó cứng vào 1 domain duy nhất.
         @Volatile
-        private var activeBaseIndex = 0
+        private var resolvedBaseUrl: String? = baseUrls.singleOrNull()
 
         // Cache segment đã prefetch để không tải lại khi tới lượt đọc thật.
         private val prefetchCache = java.util.concurrent.ConcurrentHashMap<Int, ByteArray>()
@@ -578,73 +481,44 @@ object HydraxInterceptor : Interceptor {
             openSegIndex = -1
         }
 
-        /**
-         * Mở kết nối HTTP tới segment nhưng KHÔNG đọc hết body — trả về source để đọc dần.
-         * Thử lần lượt từng domain trong baseUrls bắt đầu từ activeBaseIndex; nếu domain
-         * hiện tại lỗi (exception khi connect, HTTP không thành công, hoặc content-type
-         * không phải video — xem ghi chú bên dưới), tự chuyển sang domain kế tiếp và cập
-         * nhật activeBaseIndex để các lần đọc segment sau dùng luôn domain đã xác nhận sống,
-         * không phải dò lại từ đầu mỗi lần.
+        /** Mở kết nối HTTP tới segment nhưng KHÔNG đọc hết body — trả về source để đọc dần.
+         *
+         * Thử domain đã chốt (resolvedBaseUrl) trước nếu có. Nếu chưa chốt hoặc domain đó
+         * lỗi, thử lần lượt toàn bộ baseUrls — CDN có thể phân domain khác nhau theo
+         * resolution, nên không thể biết trước domain nào đúng chỉ từ metadata tĩnh.
+         * Domain đầu tiên trả về thành công sẽ được chốt lại cho các lần gọi sau.
          */
         private fun openSegmentStream(index: Int): Pair<Response, okio.BufferedSource>? {
-            val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
-            val token = tokenFor(path)
+            val ordered = resolvedBaseUrl?.let { resolved ->
+                listOf(resolved) + baseUrls.filter { it != resolved }
+            } ?: baseUrls
 
-            val startIndex = activeBaseIndex
-            for (offset in baseUrls.indices) {
-                val tryIndex = (startIndex + offset) % baseUrls.size
-                val baseUrl = baseUrls[tryIndex]
-                val segUrl = "$baseUrl/sora/$totalSize/$token"
+            for (candidate in ordered) {
+                val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
+                val token = tokenFor(path)
+                val segUrl = "$candidate/sora/$totalSize/$token"
                 val req = Request.Builder()
                     .url(segUrl)
                     .header("Referer", "https://abysscdn.com/")
                     .build()
-
                 val result = runCatching {
                     val resp = client.newCall(req).execute()
                     if (!resp.isSuccessful) {
                         resp.close()
-                        return@runCatching null
-                    }
-
-                    // NGUYÊN NHÂN THẬT SỰ của "ERROR_CODE_PARSING_CONTAINER_MALFORMED (3001)":
-                    // code cũ chỉ kiểm tra resp.isSuccessful (status 2xx) rồi coi ngay là dữ
-                    // liệu segment hợp lệ, không hề kiểm tra Content-Type. Khi domain CDN cho
-                    // đúng phim/tập này đang lỗi/die/bị chặn ở tầng ứng dụng (không phải tầng
-                    // TCP — nên vẫn connect được), Abyss/CDN trung gian có thể trả về một
-                    // trang lỗi HTML (hoặc JSON lỗi) NHƯNG VẪN kèm status 200 OK. Code cũ coi
-                    // đây là bytes MP4 hợp lệ và stream thẳng xuống player -> ExoPlayer cố
-                    // parse HTML/JSON đó như MP4 container -> đúng lỗi
-                    // PARSING_CONTAINER_MALFORMED (3001), và dòng "Không tìm thấy liên kết"
-                    // khớp với nội dung trang lỗi phổ biến của CDN khi không tìm thấy file
-                    // tương ứng với token/path yêu cầu. Chỉ lộ ra ở phim/tập cụ thể có CDN
-                    // backend đang gặp vấn đề, các phim khác dùng segment thật nên không sao.
-                    //
-                    // Sửa: kiểm tra Content-Type trước khi chấp nhận response. Response hợp
-                    // lệ từ Abyss luôn là "video/mp4" hoặc "application/octet-stream" (binary);
-                    // nếu là "text/html"/"application/json"/"text/plain" (trang lỗi) thì coi
-                    // như domain này thất bại cho segment này, đóng kết nối, và (nhờ vòng lặp
-                    // bên ngoài) tự thử domain kế tiếp thay vì đẩy rác xuống player.
-                    val contentType = resp.header("Content-Type")?.lowercase(java.util.Locale.ROOT)
-                    val looksLikeErrorPage = contentType != null &&
-                        (contentType.contains("text/html") || contentType.contains("application/json") ||
-                         contentType.contains("text/plain"))
-                    if (looksLikeErrorPage) {
-                        resp.close()
-                        return@runCatching null
-                    }
-
-                    val source = resp.body?.source()
-                    if (source == null) {
-                        resp.close()
                         null
                     } else {
-                        resp to source
+                        val source = resp.body?.source()
+                        if (source == null) {
+                            resp.close()
+                            null
+                        } else {
+                            resp to source
+                        }
                     }
                 }.getOrNull()
 
                 if (result != null) {
-                    activeBaseIndex = tryIndex
+                    resolvedBaseUrl = candidate
                     return result
                 }
             }
@@ -669,37 +543,32 @@ object HydraxInterceptor : Interceptor {
             }
         }
 
-        /**
-         * Tải trọn segment vào RAM — dùng riêng cho prefetch chạy nền (không cần độ trễ
-         * thấp). Dùng activeBaseIndex hiện tại (domain đã xác nhận sống bởi
-         * openSegmentStream) thay vì domain[0] cố định; nếu domain đó lỗi cho segment
-         * này, thử tiếp các domain còn lại — cùng logic fallback như openSegmentStream,
-         * nhưng không cập nhật activeBaseIndex (chỉ để tải nền, không phải luồng chính).
+        /** Tải trọn segment vào RAM — dùng riêng cho prefetch chạy nền (không cần độ trễ thấp).
+         * Cũng thử domain đã chốt trước, rồi lần lượt các domain còn lại — xem [openSegmentStream].
          */
         private fun fetchSegment(index: Int): ByteArray {
-            val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
-            val token = tokenFor(path)
+            val ordered = resolvedBaseUrl?.let { resolved ->
+                listOf(resolved) + baseUrls.filter { it != resolved }
+            } ?: baseUrls
 
-            val startIndex = activeBaseIndex
-            for (offset in baseUrls.indices) {
-                val tryIndex = (startIndex + offset) % baseUrls.size
-                val segUrl = "${baseUrls[tryIndex]}/sora/$totalSize/$token"
+            for (candidate in ordered) {
+                val path = "/mp4/$md5Id/$resId/$totalSize/$FRAGMENT_SIZE/$index"
+                val token = tokenFor(path)
+                val segUrl = "$candidate/sora/$totalSize/$token"
                 val req = Request.Builder()
                     .url(segUrl)
                     .header("Referer", "https://abysscdn.com/")
                     .build()
                 val bytes = runCatching {
                     client.newCall(req).execute().use { resp ->
-                        if (!resp.isSuccessful) return@use null
-                        val contentType = resp.header("Content-Type")?.lowercase(java.util.Locale.ROOT)
-                        val looksLikeErrorPage = contentType != null &&
-                            (contentType.contains("text/html") || contentType.contains("application/json") ||
-                             contentType.contains("text/plain"))
-                        if (looksLikeErrorPage) return@use null
-                        resp.body?.bytes()
+                        if (!resp.isSuccessful) null else resp.body?.bytes()
                     }
                 }.getOrNull()
-                if (bytes != null && bytes.isNotEmpty()) return bytes
+
+                if (bytes != null) {
+                    resolvedBaseUrl = candidate
+                    return bytes
+                }
             }
             return ByteArray(0)
         }
