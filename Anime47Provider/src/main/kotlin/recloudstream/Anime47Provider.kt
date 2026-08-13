@@ -158,6 +158,16 @@ class Anime47Provider : MainAPI() {
         }
     }
 
+    // GHI CHÚ BẢO MẬT (không sửa trong bản này để tránh phá vỡ UI cài đặt đang hoạt
+    // động ổn định): mật khẩu hiện lưu dạng plaintext trong SharedPreferences thường.
+    // Điều này chỉ lộ dữ liệu nếu thiết bị đã bị root/truy cập vật lý trực tiếp vào
+    // filesystem của app (nằm ngoài sandbox Android bình thường) — không phải lỗ hổng
+    // qua mạng. Nếu muốn nâng cấp: thay bằng androidx.security-crypto's
+    // EncryptedSharedPreferences, nhưng lưu ý Anime47SettingsFragment dùng
+    // PreferenceFragmentCompat với EditTextPreference đọc/ghi qua
+    // preferenceManager.sharedPreferences mặc định — cần viết PreferenceDataStore tuỳ
+    // chỉnh trỏ vào EncryptedSharedPreferences rồi gọi preferenceManager.preferenceDataStore
+    // = ... để cả 2 phía (đọc ở đây, ghi ở SettingsFragment) luôn dùng chung 1 store.
     private val prefs: SharedPreferences?
         get() {
             val activity = CommonActivity.activity ?: return null
@@ -640,33 +650,86 @@ class Anime47Provider : MainAPI() {
                             fetchApi("$apiBaseUrl/anime/watch/episode/$id?lang=vi")
 
                         val streams = watchResponse?.streams ?: return@async
-                        var episodeLoaded = false
 
-                        for (stream in streams) {
-                            val url = stream.url
-                            val serverName = stream.server_name
+                        // HIỆU NĂNG: trước đây các server (FE, HY, ...) của CÙNG 1 episode được
+                        // xử lý TUẦN TỰ trong 1 vòng for. Với server "HY", getLinks() phải gọi
+                        // thêm 1 network round-trip riêng tới abysscdn.com để lấy + giải mã
+                        // "datas". Một episode có nhiều server HY (rất phổ biến, người dùng
+                        // thường xem được 3-4 server để chọn) khiến loadLinks() phải CHỜ TUẦN
+                        // TỰ từng request đó cộng dồn lại — chính là nguyên nhân "bấm play chờ
+                        // load lâu". Dùng async cho mỗi stream để toàn bộ request HY/FE của
+                        // cùng 1 episode chạy song song thay vì nối đuôi nhau; tổng thời gian
+                        // chỉ còn bằng request chậm nhất thay vì tổng tất cả.
+                        val episodeLoadedFlags = streams.map { stream ->
+                            async {
+                                val url = stream.url
+                                val serverName = stream.server_name
 
-                            if (url.isNullOrBlank()) continue
+                                if (url.isNullOrBlank()) return@async false
 
-                            // Server "HY" (Hydrax/Abyss.to) không trả về m3u8 thật, mà là một trang
-                            // embed chứa metadata mã hóa AES-CTR (xem HydraxExtractor.kt). Phải đi
-                            // qua HydraxExtractor + HydraxInterceptor thay vì coi url là m3u8 trực tiếp.
-                            if (HydraxExtractor.isHydraxUrl(url)) {
-                                try {
-                                    val hydraxLinks = HydraxExtractor.getLinks(
-                                        streamUrl = url,
-                                        providerName = this@Anime47Provider.name,
-                                        serverName = serverName,
-                                        referer = referer
-                                    )
-                                    hydraxLinks.forEach { callback(it) }
-                                    if (hydraxLinks.isNotEmpty()) {
-                                        loaded.set(true)
-                                        episodeLoaded = true
+                                // Server "HY" (Hydrax/Abyss.to) không trả về m3u8 thật, mà là một trang
+                                // embed chứa metadata mã hóa AES-CTR (xem HydraxExtractor.kt). Phải đi
+                                // qua HydraxExtractor + HydraxInterceptor thay vì coi url là m3u8 trực tiếp.
+                                if (HydraxExtractor.isHydraxUrl(url)) {
+                                    var hyLoaded = false
+                                    try {
+                                        val hydraxLinks = HydraxExtractor.getLinks(
+                                            streamUrl = url,
+                                            providerName = this@Anime47Provider.name,
+                                            serverName = serverName,
+                                            referer = referer
+                                        )
+                                        hydraxLinks.forEach { callback(it) }
+                                        if (hydraxLinks.isNotEmpty()) {
+                                            loaded.set(true)
+                                            hyLoaded = true
+                                        }
+                                    } catch (e: Exception) {
+                                        // bỏ qua lỗi riêng của HY, không chặn các server khác
                                     }
-                                } catch (e: Exception) {
-                                    // bỏ qua lỗi riêng của HY, không chặn các server khác
+
+                                    stream.subtitles?.forEach { subtitle ->
+                                        if (!subtitle.file.isNullOrBlank()) {
+                                            val label = mapSubtitleLabel(subtitle.label ?: "Vietnamese")
+                                            subtitleCallback(SubtitleFile(label, subtitle.file))
+                                        }
+                                    }
+                                    return@async hyLoaded
                                 }
+
+                                // Chấp nhận mọi server có URL hợp lệ (FE, HY, hoặc bất kỳ server nào khác),
+                                // thay vì chỉ giới hạn ở "FE"/jwplayer và loại trừ "HY" như logic gốc.
+                                val headers = mutableMapOf(
+                                    "Referer" to referer,
+                                    "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                                    "sec-ch-ua" to "\"Chromium\";v=\"120\", \"Not?A_Brand\";v=\"24\"",
+                                    "sec-ch-ua-mobile" to "?1",
+                                    "sec-ch-ua-platform" to "\"Android\""
+                                )
+
+                                if (url.contains("vlogphim.net")) {
+                                    headers["Origin"] = referer
+                                    try {
+                                        val host = URL(url).host
+                                        headers["authority"] = host
+                                    } catch (e: Exception) {
+                                        headers["authority"] = "pl.vlogphim.net"
+                                    }
+                                }
+
+                                val link = newExtractorLink(
+                                    this@Anime47Provider.name,
+                                    serverName ?: this@Anime47Provider.name,
+                                    url,
+                                    ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = referer
+                                    this.headers = headers
+                                    this.quality = Qualities.Unknown.value
+                                }
+
+                                callback(link)
+                                loaded.set(true)
 
                                 stream.subtitles?.forEach { subtitle ->
                                     if (!subtitle.file.isNullOrBlank()) {
@@ -674,51 +737,11 @@ class Anime47Provider : MainAPI() {
                                         subtitleCallback(SubtitleFile(label, subtitle.file))
                                     }
                                 }
-                                continue
+                                true
                             }
+                        }.awaitAll()
 
-                            // Chấp nhận mọi server có URL hợp lệ (FE, HY, hoặc bất kỳ server nào khác),
-                            // thay vì chỉ giới hạn ở "FE"/jwplayer và loại trừ "HY" như logic gốc.
-                            val headers = mutableMapOf(
-                                "Referer" to referer,
-                                "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                                "sec-ch-ua" to "\"Chromium\";v=\"120\", \"Not?A_Brand\";v=\"24\"",
-                                "sec-ch-ua-mobile" to "?1",
-                                "sec-ch-ua-platform" to "\"Android\""
-                            )
-
-                            if (url.contains("vlogphim.net")) {
-                                headers["Origin"] = referer
-                                try {
-                                    val host = URL(url).host
-                                    headers["authority"] = host
-                                } catch (e: Exception) {
-                                    headers["authority"] = "pl.vlogphim.net"
-                                }
-                            }
-
-                            val link = newExtractorLink(
-                                this@Anime47Provider.name,
-                                serverName ?: this@Anime47Provider.name,
-                                url,
-                                ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = referer
-                                this.headers = headers
-                                this.quality = Qualities.Unknown.value
-                            }
-
-                            callback(link)
-                            loaded.set(true)
-                            episodeLoaded = true
-
-                            stream.subtitles?.forEach { subtitle ->
-                                if (!subtitle.file.isNullOrBlank()) {
-                                    val label = mapSubtitleLabel(subtitle.label ?: "Vietnamese")
-                                    subtitleCallback(SubtitleFile(label, subtitle.file))
-                                }
-                            }
-                        }
+                        val episodeLoaded = episodeLoadedFlags.any { it }
 
                         // Báo "đã xem" lên hệ thống DCC chỉ khi thực sự lấy được ít nhất
                         // 1 link phát cho episode này (tránh cộng điểm cho tập lỗi/rỗng).
