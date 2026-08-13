@@ -44,7 +44,6 @@ object HydraxExtractor {
     // mapper riêng cho object này: chỉ khởi tạo 1 lần duy nhất khi class được load (Kotlin
     // "object" là singleton), nên chi phí khởi tạo ObjectMapper không lặp lại ở runtime.
     private val mapper = jacksonObjectMapper()
-    private const val FRAGMENT_SIZE = 2097152L // 2 MiB, must match server-side chunking
     const val RELAY_HOST = "hydrax-relay.internal"
     private const val ABYSS_BASE_URL = "https://abysscdn.com"
 
@@ -97,12 +96,6 @@ object HydraxExtractor {
         return Base64.getEncoder().encodeToString(first.toByteArray()).replace("=", "")
     }
 
-    private fun buildSegmentToken(md5Id: Int, resId: Int, size: Long, index: Int): String {
-        val path = "/mp4/$md5Id/$resId/$size/$FRAGMENT_SIZE/$index"
-        val key = keyForNumber(size)
-        return doubleBase64(aesCtrEncryptToIso(path, key))
-    }
-
     // ===================== models =====================
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -151,14 +144,20 @@ object HydraxExtractor {
 
     private suspend fun fetchMp4Metadata(videoId: String, referer: String): Mp4Data? {
         val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
-        val html = app.get(
+        val response = app.get(
             embedUrl,
             headers = mapOf(
                 "Referer" to referer,
                 "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
             ),
             timeout = 15000
-        ).text
+        )
+
+        // Fail sớm và rõ ràng nếu Abyss trả lỗi HTTP (404/5xx/rate-limit...) thay vì
+        // để regex bên dưới âm thầm không tìm thấy "datas" và trả null mập mờ — phân
+        // biệt được "trang embed lỗi" với "trang hợp lệ nhưng đổi cấu trúc HTML".
+        if (!response.isSuccessful) return null
+        val html = response.text
 
         // HIỆU NĂNG: trước đây dùng Jsoup.parse() để dựng toàn bộ cây DOM của trang embed
         // rồi select("script") chỉ để tìm 1 dòng "const datas = ...". Parse DOM cho toàn
@@ -225,6 +224,18 @@ object HydraxExtractor {
         val encodedBase = URLEncoder.encode(baseUrl, "UTF-8")
         return "https://$RELAY_HOST/video.mp4?base=$encodedBase&md5=$md5Id&res=$resId&size=$size"
     }
+
+    // Dùng lại bởi HydraxInterceptor.SegmentSource để tránh trùng lặp cài đặt crypto
+    // (trước đây SegmentSource có bản sao riêng của các hàm này — nguy cơ 2 bản lệch
+    // nhau nếu chỉ sửa 1 nơi trong tương lai).
+    // HIỆU NĂNG: nhận sẵn `key` đã tính (thay vì `totalSize` thô) để caller có thể cache
+    // key theo `totalSize` — key không đổi trong suốt vòng đời 1 SegmentSource/video,
+    // nên chỉ cần tính (MD5 digest) đúng 1 lần thay vì mỗi lần gọi cho mỗi segment.
+    internal fun tokenForPathWithKey(path: String, key: String): String {
+        return doubleBase64(aesCtrEncryptToIso(path, key))
+    }
+
+    internal fun keyForTotalSize(totalSize: Long): String = keyForNumber(totalSize)
 }
 
 /**
@@ -251,7 +262,13 @@ object HydraxInterceptor : Interceptor {
     // dụng ngày càng nặng máy/chậm dần theo thời gian sử dụng. Dùng chung 1 thread pool
     // nhỏ ở cấp singleton cho toàn bộ prefetch của mọi segment, không bao giờ shutdown
     // theo từng instance nữa.
-    private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(3)
+    // HIỆU NĂNG/AN TOÀN: dùng daemon threads (thay vì mặc định non-daemon của
+    // newFixedThreadPool) để pool không bao giờ ngăn JVM/app thoát hoặc "treo" tiến
+    // trình nếu vòng đời plugin không gọi tới việc dọn executor này. Non-daemon threads
+    // giữ ứng dụng chạy ngầm ngay cả khi mọi hoạt động thực sự đã kết thúc.
+    private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(3) { runnable ->
+        Thread(runnable, "hydrax-prefetch").apply { isDaemon = true }
+    }
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -551,40 +568,17 @@ object HydraxInterceptor : Interceptor {
         }
 
         // HIỆU NĂNG: key phụ thuộc duy nhất vào `totalSize`, vốn không đổi trong suốt
-        // vòng đời của SegmentSource (1 file/1 kết nối phát). Trước đây key này bị tính
-        // lại (MD5 digest + string build) ở MỌI segment request (mỗi ~2MB dữ liệu), dù
-        // kết quả luôn giống hệt nhau — lãng phí CPU đáng kể khi phát các file lớn có
-        // hàng chục/hàng trăm segment. Tính 1 lần và tái sử dụng.
-        private val tokenKey: String by lazy { md5HexOfDigits(totalSize) }
+        // vòng đời của SegmentSource (1 file/1 kết nối phát). Tính 1 lần (MD5 digest)
+        // và tái sử dụng cho mọi segment thay vì tính lại ở mỗi lần gọi tokenFor() —
+        // tránh lãng phí CPU khi phát các file lớn có hàng chục/hàng trăm segment.
+        //
+        // Dùng chung HydraxExtractor.tokenForPathWithKey()/keyForTotalSize() (đã gộp
+        // crypto helpers vào 1 nơi duy nhất) thay vì giữ bản sao riêng của
+        // aesCtrEncryptToIso/doubleBase64 trong class này — tránh 2 cài đặt crypto có
+        // thể lệch nhau nếu chỉ 1 bên được sửa trong tương lai.
+        private val tokenKey: String by lazy { HydraxExtractor.keyForTotalSize(totalSize) }
 
-        private fun tokenFor(path: String): String {
-            val encrypted = aesCtrEncryptToIso(path, tokenKey)
-            return doubleBase64(encrypted)
-        }
-
-        private fun md5HexOfDigits(value: Long): String {
-            val bytes = value.toString().map { c ->
-                if (c.isDigit()) c.digitToInt().toByte() else c.code.toByte()
-            }.toByteArray()
-            val digest = java.security.MessageDigest.getInstance("MD5").digest(bytes)
-            return digest.joinToString("") { "%02x".format(it) }
-        }
-
-        private fun aesCtrEncryptToIso(data: String, keyHex: String): String {
-            val keyBytes = keyHex.toByteArray(Charsets.UTF_8)
-            val iv = keyBytes.copyOfRange(0, 16)
-            val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(iv))
-            val encrypted = cipher.doFinal(data.toByteArray(Charsets.UTF_8))
-            return String(encrypted, Charsets.ISO_8859_1)
-        }
-
-        private fun doubleBase64(input: String): String {
-            val first = Base64.getEncoder().encodeToString(input.toByteArray(Charsets.ISO_8859_1)).replace("=", "")
-            return Base64.getEncoder().encodeToString(first.toByteArray()).replace("=", "")
-        }
+        private fun tokenFor(path: String): String =
+            HydraxExtractor.tokenForPathWithKey(path, tokenKey)
     }
 }
-  
- 
- 
