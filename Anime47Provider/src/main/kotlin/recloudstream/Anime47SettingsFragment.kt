@@ -70,6 +70,12 @@ class Anime47SettingsFragment : PreferenceFragmentCompat() {
                     remove("anime47_password")
                     apply()
                 }
+                // SỬA LỖI: trước đây chỉ xoá SharedPreferences, còn token đã đăng nhập
+                // vẫn nằm trong bộ nhớ của Anime47Provider đang chạy nên tài khoản coi
+                // như chưa thực sự đăng xuất khỏi phiên hiện tại (vẫn tiếp tục gọi API
+                // bằng token cũ cho tới khi nó tự hết hạn). Gọi thẳng vào companion của
+                // provider để vô hiệu hoá token đang cache ngay lập tức.
+                Anime47Provider.invalidateCachedSession()
                 emailPref.summary = "Chưa thiết lập"
                 emailPref.text = ""
                 passwordPref.summary = "Chưa thiết lập"
