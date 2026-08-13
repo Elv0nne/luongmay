@@ -48,6 +48,15 @@ object HydraxExtractor {
     const val RELAY_HOST = "hydrax-relay.internal"
     private const val ABYSS_BASE_URL = "https://abysscdn.com"
 
+    // SỬA LỖI (ngân sách thời gian): trước đây mỗi lần gọi embed dùng timeout=15000 và
+    // fetchMp4Metadata() có thể gọi TUẦN TỰ tới 2 lần (retry 1 lần) -> tối đa 30s chỉ
+    // riêng bước này, có thể một mình vượt quá toàn bộ ngân sách 25s mà
+    // Anime47Provider.loadLinks() dành cho CẢ episode (watch-info + mọi server). Hạ
+    // xuống 8s mỗi lần gọi: đủ cho hầu hết trường hợp mạng bình thường (trang embed nhẹ,
+    // không phải file media lớn), trong khi tổng trường hợp xấu nhất (8s + 8s = 16s) nằm
+    // gọn trong Anime47Provider.EPISODE_TIMEOUT_MS sau khi trừ đi thời gian watch-info.
+    const val HY_EMBED_TIMEOUT_MS = 8_000
+
     // SỬA LỖI (nhất quán/độ tin cậy): mọi request khác trong plugin (getMainPage, search,
     // load, fetchApi, markEpisodeWatched...) đều truyền interceptor = CloudflareKiller()
     // của Anime47Provider để tự động vượt qua trang thách thức Cloudflare (challenge page)
@@ -173,12 +182,12 @@ object HydraxExtractor {
         // là thất bại thật — giảm tỷ lệ "server HY không có link" giả do mạng chập chờn
         // thay vì lỗi thật sự từ phía Abyss.
         var response = runCatching {
-            app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
+            app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = HY_EMBED_TIMEOUT_MS)
         }.getOrNull()
 
         if (response == null || !response.isSuccessful) {
             response = runCatching {
-                app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
+                app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = HY_EMBED_TIMEOUT_MS)
             }.getOrNull()
         }
 
