@@ -47,6 +47,12 @@ object HydraxExtractor {
     const val RELAY_HOST = "hydrax-relay.internal"
     private const val ABYSS_BASE_URL = "https://abysscdn.com"
 
+    // HIỆU NĂNG: biên dịch 1 lần duy nhất khi object được load (Kotlin "object" là
+    // singleton) thay vì mỗi lần gọi fetchMp4Metadata() — tức mỗi lần lấy link cho
+    // 1 server "HY" của 1 tập phim. Cùng tinh thần tối ưu regex đã áp dụng ở
+    // Anime47Provider.cdnFixRegex / animeIdRegex và HydraxInterceptor.rangeHeaderRegex.
+    private val datasRegex = Regex("""const\s+datas\s*=\s*"([^"]*)"""")
+
     private val HY_HOSTS = listOf("abysscdn.com", "playhydrax.com", "zplayer.io", "short.ink")
 
     fun isHydraxUrl(url: String): Boolean {
@@ -165,7 +171,7 @@ object HydraxExtractor {
         // ta chỉ cần đúng 1 giá trị chuỗi nằm trong <script>. Chạy regex trực tiếp trên
         // HTML thô cho kết quả giống hệt (không phụ thuộc cấu trúc DOM) nhưng rẻ hơn
         // nhiều lần, và bỏ được toàn bộ chi phí dựng DOM cho mỗi lần lấy link HY.
-        val encodedDatas = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(html)
+        val encodedDatas = datasRegex.find(html)
             ?.groupValues?.get(1) ?: return null
 
         val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
@@ -405,6 +411,15 @@ object HydraxInterceptor : Interceptor {
                 prefetchCache.remove(segIndex)?.let { bytes ->
                     val offsetInSeg = (currentPos - segStart).toInt().coerceIn(0, bytes.size)
                     currentBuffer.write(bytes, offsetInSeg, bytes.size - offsetInSeg)
+                    // HIỆU NĂNG: đánh dấu segment này là "đã có sẵn" bằng cách cập nhật
+                    // openSegIndex ngay cả khi dữ liệu đến từ prefetch cache (không phải
+                    // từ openSegmentStream()). Trước đây không cập nhật ở đây khiến lần
+                    // read() kế tiếp — sau khi currentBuffer bị đọc cạn — hiểu lầm rằng
+                    // segment hiện tại "chưa từng mở kết nối" (vì openSegIndex vẫn giữ
+                    // giá trị của segment TRƯỚC ĐÓ) và tự ý mở lại 1 connection HTTP mới
+                    // để tải LẠI đúng segment vừa lấy từ prefetch, gây lãng phí băng
+                    // thông + độ trễ không cần thiết trong lúc phát.
+                    openSegIndex = segIndex
                     schedulePrefetch(segIndex + 1)
                 }
             }
@@ -420,6 +435,19 @@ object HydraxInterceptor : Interceptor {
 
             // Chưa có sẵn trong buffer/cache: đọc trực tiếp (streaming) từ kết nối HTTP,
             // mở kết nối mới nếu chưa có hoặc đã chuyển sang segment khác.
+            val remaining = endByteInclusive - currentPos + 1
+            val wantToRead = minOf(byteCount, remaining, FRAGMENT_SIZE)
+
+            // SỬA LỖI: Source.skip() của Okio có thể ném IOException nếu kết nối kết
+            // thúc/bị gián đoạn trước khi skip đủ số byte yêu cầu (ví dụ server đóng kết
+            // nối ngay sau khi mở, hoặc mạng chập chờn giữa lúc mở connection và lúc
+            // skip). Trước đây lệnh gọi này không có try-catch, khiến exception thoát
+            // thẳng ra khỏi read() và làm crash luồng phát video của player thay vì được
+            // xử lý như một lỗi mạng có thể phục hồi. Nếu skip lỗi ngay sau khi mở, coi
+            // như read() trực tiếp thất bại (read = -1L, KHÔNG return sớm) để rơi xuống
+            // đúng logic retry-1-lần đã có sẵn bên dưới, tận dụng cùng một cơ chế phục
+            // hồi thay vì có 2 đường xử lý lỗi tách biệt.
+            var read: Long
             if (openSegIndex != segIndex) {
                 closeOpenConnection()
                 val opened = openSegmentStream(segIndex) ?: return -1L
@@ -430,17 +458,33 @@ object HydraxInterceptor : Interceptor {
                 // Bỏ qua phần đầu segment nếu currentPos không trùng đầu segment
                 // (trường hợp resume giữa segment sau khi đã đọc một phần).
                 val skipBytes = currentPos - segStart
-                if (skipBytes > 0) {
-                    openSource?.skip(skipBytes)
+                val skipFailed = if (skipBytes > 0) {
+                    try {
+                        openSource?.skip(skipBytes)
+                        false
+                    } catch (e: Exception) {
+                        true
+                    }
+                } else {
+                    false
                 }
-            }
 
-            val remaining = endByteInclusive - currentPos + 1
-            val wantToRead = minOf(byteCount, remaining, FRAGMENT_SIZE)
-            var read = try {
-                openSource?.read(sink, wantToRead) ?: -1L
-            } catch (e: Exception) {
-                -1L
+                read = if (skipFailed) {
+                    closeOpenConnection()
+                    -1L
+                } else {
+                    try {
+                        openSource?.read(sink, wantToRead) ?: -1L
+                    } catch (e: Exception) {
+                        -1L
+                    }
+                }
+            } else {
+                read = try {
+                    openSource?.read(sink, wantToRead) ?: -1L
+                } catch (e: Exception) {
+                    -1L
+                }
             }
 
             // read == -1 có 2 khả năng: (a) đã đọc hết đúng segment này (bình thường,
@@ -459,7 +503,18 @@ object HydraxInterceptor : Interceptor {
                         openSource = retryOpened.second
                         openSegIndex = segIndex
                         val skipBytes = currentPos - segStart
-                        if (skipBytes > 0) openSource?.skip(skipBytes)
+                        // SỬA LỖI: cùng vấn đề skip() có thể ném IOException như ở nhánh
+                        // mở kết nối lần đầu phía trên — bọc trong try-catch để một lỗi
+                        // skip ở lần retry không làm crash toàn bộ read(), mà chỉ khiến
+                        // lần đọc này trả về -1L (được xử lý như "hết segment/lỗi không
+                        // phục hồi được" ở logic ngay bên dưới).
+                        if (skipBytes > 0) {
+                            try {
+                                openSource?.skip(skipBytes)
+                            } catch (e: Exception) {
+                                closeOpenConnection()
+                            }
+                        }
                         read = try {
                             openSource?.read(sink, wantToRead) ?: -1L
                         } catch (e: Exception) {
