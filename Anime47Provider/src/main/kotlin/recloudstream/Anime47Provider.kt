@@ -69,7 +69,25 @@ class Anime47Provider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.Cartoon)
 
     private val interceptor = CloudflareKiller()
-    private var cachedToken: String? = null
+
+    // SỬA LỖI (race condition + đăng xuất không hoàn toàn): trước đây cachedToken là
+    // "var" thường thuộc riêng instance, được đọc ở ensureToken() và ghi/null-hoá ở
+    // fetchApi() (dòng "cachedToken = null") mà KHÔNG qua tokenMutex. Khi loadLinks()
+    // chạy song song nhiều episode (mỗi cái tự gọi fetchApi() -> có thể tự phát hiện
+    // token cũ hết hạn), nhiều coroutine có thể đồng thời set cachedToken = null ngay
+    // sau khi một coroutine khác vừa login lại thành công và set token mới -> token mới
+    // bị ghi đè về null, gây login lại thừa liên tục, tốn round-trip mạng.
+    //
+    // Đồng thời, vì token trước đây chỉ nằm trong biến instance, thao tác "Xóa thông
+    // tin đăng nhập" ở màn hình cài đặt (1 class hoàn toàn tách biệt) không có cách nào
+    // vô hiệu hoá được token đang cache trong provider đang chạy — tài khoản coi như
+    // chưa thực sự đăng xuất khỏi phiên hiện tại. Nay dùng chung AtomicReference cấp
+    // companion (Session.sharedCachedToken): vừa đọc/ghi an toàn giữa nhiều coroutine,
+    // vừa cho phép Settings gọi Session.invalidateCachedSession() để đăng xuất ngay lập
+    // tức instance provider đang chạy mà không cần giữ tham chiếu tới nó.
+    private var cachedToken: String?
+        get() = Session.sharedCachedToken.get()
+        set(value) = Session.sharedCachedToken.set(value)
 
     // ===================== DCC: điểm danh & lưu lịch sử xem =====================
     // Xác nhận qua DevTools (bắt request thật của web anime47.love):
@@ -265,7 +283,13 @@ class Anime47Provider : MainAPI() {
     // và chỉ retry request một lần thay vì bắt người dùng thao tác thủ công.
     private val tokenMutex = Mutex()
 
-    private suspend fun ensureToken(forceRefresh: Boolean = false): String? {
+    // staleToken: khi forceRefresh=true, đây là token mà caller đã thấy bị server từ
+    // chối (hết hạn/401). Dùng để so sánh dưới lock thay vì luôn luôn login lại — nếu
+    // một coroutine khác đã kịp login lại và cachedToken hiện tại KHÁC staleToken (tức
+    // đã có token mới hơn), coroutine hiện tại tái sử dụng luôn token đó thay vì gọi
+    // /auth/login thêm một lần nữa. Tránh trường hợp N coroutine cùng phát hiện 1 token
+    // hết hạn (vd. N tập phim tải song song) và tạo N request login trùng lặp thay vì 1.
+    private suspend fun ensureToken(forceRefresh: Boolean = false, staleToken: String? = null): String? {
         if (!forceRefresh) {
             val existing = cachedToken
             if (!existing.isNullOrBlank()) {
@@ -278,11 +302,16 @@ class Anime47Provider : MainAPI() {
         return tokenMutex.withLock {
             // Sau khi giành được lock, kiểm tra lại: có thể một coroutine khác đã
             // login lại thành công trong lúc chờ, nên không cần login lại lần nữa.
+            val existing = cachedToken
             if (!forceRefresh) {
-                val existing = cachedToken
                 if (!existing.isNullOrBlank()) {
                     return@withLock existing
                 }
+            } else if (!existing.isNullOrBlank() && existing != staleToken) {
+                // Một coroutine khác đã login lại thành công với token mới (khác với
+                // token mà caller này biết là đã hỏng) trong lúc chờ lock -> dùng luôn,
+                // không cần gọi /auth/login thêm lần nữa.
+                return@withLock existing
             }
 
             val email = prefs?.getString("anime47_email", "") ?: ""
@@ -322,8 +351,8 @@ class Anime47Provider : MainAPI() {
         }
     }
 
-    private suspend fun getAuthHeaders(forceRefresh: Boolean = false): Map<String, String> {
-        val token = ensureToken(forceRefresh)
+    private suspend fun getAuthHeaders(forceRefresh: Boolean = false, staleToken: String? = null): Map<String, String> {
+        val token = ensureToken(forceRefresh, staleToken)
         return if (token != null) {
             mapOf("Authorization" to "Bearer $token")
         } else {
@@ -356,8 +385,14 @@ class Anime47Provider : MainAPI() {
         // người dùng tự vào cài đặt đăng nhập lại.
         val looksStale = looksExpiredOrUnauthorized(text) || firstResponse.code == 401
         if (looksStale) {
-            cachedToken = null
-            val retryHeaders = getAuthHeaders(forceRefresh = true)
+            // SỬA LỖI (race condition): không còn "cachedToken = null" ở đây ngoài
+            // mutex — thao tác này trước đây có thể vô tình xoá mất token mới mà một
+            // coroutine khác vừa login lại thành công (xem ghi chú tại ensureToken()).
+            // Thay vào đó truyền token cũ (đã biết là hỏng) vào ensureToken() để nó tự
+            // quyết định dưới lock: chỉ login lại nếu cachedToken hiện tại vẫn đúng là
+            // token hỏng này; nếu đã có ai đó thay bằng token mới hơn thì dùng luôn.
+            val staleToken = headers["Authorization"]?.removePrefix("Bearer ")
+            val retryHeaders = getAuthHeaders(forceRefresh = true, staleToken = staleToken)
 
             if (retryHeaders.containsKey("Authorization")) {
                 text = app.get(
@@ -388,11 +423,22 @@ class Anime47Provider : MainAPI() {
 
         val url = "$apiBaseUrl${request.data}&page=$page"
 
+        // SỬA LỖI: trước đây MỌI exception (kể cả lỗi mạng thật sự: timeout, mất kết
+        // nối, DNS lỗi...) đều bị nuốt thành "response = null", rồi bên dưới báo nhầm
+        // là "Cấu trúc dữ liệu đã thay đổi hoặc tài khoản chưa kích hoạt" — làm người
+        // dùng/nhà phát triển hiểu sai nguyên nhân thật (vd. tưởng server đổi API trong
+        // khi chỉ là mất mạng tạm thời) và không có cách nào phân biệt hai trường hợp.
+        // Chỉ nuốt lỗi parse/dữ liệu (không phải lỗi mạng) ở đây; để lỗi mạng (IOException
+        // và các lỗi không phải do parse) thoát ra ngoài với thông tin gốc.
         val response: ApiFilterResponse? = try {
             fetchApi(url)
         } catch (e: ErrorLoadingException) {
             throw e
+        } catch (e: IOException) {
+            throw ErrorLoadingException("Không thể kết nối tới máy chủ Anime47. Vui lòng kiểm tra kết nối mạng và thử lại.")
         } catch (e: Exception) {
+            // Lỗi parse JSON hoặc cấu trúc dữ liệu bất ngờ: coi như response rỗng,
+            // xử lý tiếp bên dưới với thông báo phù hợp.
             null
         }
 
@@ -417,10 +463,16 @@ class Anime47Provider : MainAPI() {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val url = "$apiBaseUrl/search/full/?lang=vi&keyword=$encoded&page=1"
 
+        // SỬA LỖI: tương tự getMainPage(), lỗi mạng thật sự trước đây bị nuốt im lặng
+        // thành "không có kết quả" (emptyList()), khiến người dùng tưởng tìm kiếm không
+        // ra gì trong khi thực chất là mất kết nối/timeout. Chỉ coi là "không có kết
+        // quả" khi lỗi đến từ parse/dữ liệu; lỗi mạng được báo rõ ràng.
         val response: ApiSearchResponse? = try {
             fetchApi(url)
         } catch (e: ErrorLoadingException) {
             throw e
+        } catch (e: IOException) {
+            throw ErrorLoadingException("Không thể kết nối tới máy chủ Anime47. Vui lòng kiểm tra kết nối mạng và thử lại.")
         } catch (e: Exception) {
             null
         }
@@ -457,8 +509,20 @@ class Anime47Provider : MainAPI() {
                 val episodesTask = async {
                     fetchApi<ApiEpisodeResponse>("$apiBaseUrl/anime/$animeId/episodes?lang=vi")
                 }
+                // SỬA LỖI: "recommendations" chỉ là dữ liệu phụ (gợi ý phim liên quan),
+                // không thiết yếu để xem phim. Trước đây recsTask.await() nằm chung
+                // trong cùng 1 khối với info/episodes nên nếu endpoint recommendations
+                // lỗi/timeout (vốn dễ chập chờn hơn vì không quan trọng bằng, có thể bị
+                // server ưu tiên thấp hơn), toàn bộ load() ném exception khiến người
+                // dùng KHÔNG xem được phim dù title + danh sách tập vẫn tải bình thường.
+                // Bắt lỗi riêng cho recsTask, coi recommendations rỗng nếu lỗi thay vì
+                // làm hỏng toàn bộ trang chi tiết phim.
                 val recsTask = async {
-                    fetchApi<ApiRecommendationResponse>("$apiBaseUrl/anime/info/$animeId/recommendations?lang=vi")
+                    try {
+                        fetchApi<ApiRecommendationResponse>("$apiBaseUrl/anime/info/$animeId/recommendations?lang=vi")
+                    } catch (e: Exception) {
+                        null
+                    }
                 }
                 Triple(infoTask.await(), episodesTask.await(), recsTask.await())
             }
@@ -699,10 +763,24 @@ class Anime47Provider : MainAPI() {
         }
     }
 
-    private companion object {
+    // SỬA LỖI (build): Kotlin chỉ cho phép 1 companion object mỗi class — trước đây có
+    // 2 khai báo "companion object" tách biệt (1 ẩn danh cho cdnFixRegex, 1 tên
+    // "Session" cho sharedCachedToken) trong cùng file, đây là lỗi biên dịch. Gộp lại
+    // thành 1 companion object "Session" duy nhất chứa cả hai.
+    companion object Session {
         // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
         // getVideoInterceptor().
-        val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
+        private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
+
+        // Dùng chung cho mọi instance (Cloudstream chỉ tạo 1 instance provider trong
+        // thực tế), cho phép Settings vô hiệu hoá token hiện tại mà không cần giữ tham
+        // chiếu tới provider — xem ghi chú đầy đủ tại khai báo "cachedToken" ở trên.
+        val sharedCachedToken = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+        /** Gọi khi người dùng xoá thông tin đăng nhập từ màn hình cài đặt. */
+        fun invalidateCachedSession() {
+            sharedCachedToken.set(null)
+        }
     }
     // ===================== Data classes (API models) =====================
 
