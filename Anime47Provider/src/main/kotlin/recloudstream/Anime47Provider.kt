@@ -39,8 +39,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody
+import okio.Buffer
 import java.io.IOException
 import java.net.URL
 import java.net.URLEncoder
@@ -792,16 +793,55 @@ class Anime47Provider : MainAPI() {
             val body = response.body ?: return@Interceptor response
 
             try {
-                val bytes = body.bytes()
-                val offset = findMpegTsOffset(bytes)
-                val fixedBytes = if (offset > 0) bytes.copyOfRange(offset, bytes.size) else bytes
+                // HIỆU NĂNG (real fix): bản trước gọi body.bytes() — tải TOÀN BỘ segment/
+                // file vào RAM chỉ để cắt bỏ vài byte rác ở đầu (offset đồng bộ MPEG-TS),
+                // rồi mới trả cho player. Với các CDN nonprofit.asia phục vụ file lớn (vài
+                // chục MB trở lên), điều này vừa tốn RAM vừa làm player phải chờ tải xong
+                // 100% mới bắt đầu decode — triệt tiêu hoàn toàn lợi ích của streaming
+                // (đúng vấn đề mà HydraxInterceptor.SegmentSource ở trên đã xử lý). Sửa:
+                // chỉ "peek" (đọc không tiêu thụ) một cửa sổ nhỏ ở đầu source để tìm offset,
+                // sau đó skip() đúng số byte rác đó trên source thật rồi trả thẳng phần
+                // source còn lại (chưa đọc) cho player — dữ liệu được stream liên tục,
+                // không buffer toàn bộ vào bộ nhớ.
+                val source = body.source()
+                val peeked = source.peek()
+                val headerBuffer = Buffer()
+                var peekedBytes = 0L
+                while (peekedBytes < TS_SYNC_PEEK_BYTES) {
+                    val read = peeked.read(headerBuffer, TS_SYNC_PEEK_BYTES - peekedBytes)
+                    if (read == -1L) break
+                    peekedBytes += read
+                }
 
-                response.newBuilder()
-                    .body(fixedBytes.toResponseBody(body.contentType()))
-                    .build()
+                val offset = findMpegTsOffset(headerBuffer.readByteArray())
+                if (offset > 0) {
+                    source.skip(offset.toLong())
+                }
+
+                val originalLength = body.contentLength()
+                val fixedLength = if (offset > 0 && originalLength >= 0) originalLength - offset else originalLength
+
+                val fixedBody = object : ResponseBody() {
+                    override fun contentType() = body.contentType()
+                    override fun contentLength() = fixedLength
+                    override fun source() = source
+                }
+
+                val responseBuilder = response.newBuilder().body(fixedBody)
+                // Đồng bộ header Content-Length với body thật sự trả về — tránh lệch giữa
+                // header (vẫn phản ánh kích thước gốc từ server) và dữ liệu thật (đã bị cắt
+                // bớt `offset` byte), có thể khiến client HTTP nghiêm ngặt xử lý sai/cắt cụt.
+                if (offset > 0) {
+                    if (fixedLength >= 0) {
+                        responseBuilder.header("Content-Length", fixedLength.toString())
+                    } else {
+                        responseBuilder.removeHeader("Content-Length")
+                    }
+                }
+                responseBuilder.build()
             } catch (e: IOException) {
-                // Đọc body thất bại giữa chừng (mạng gián đoạn): trả lỗi gốc cho player
-                // xử lý (retry/next server) thay vì làm crash luồng phát video.
+                // Đọc/skip source thất bại giữa chừng (mạng gián đoạn): trả lỗi gốc cho
+                // player xử lý (retry/next server) thay vì làm crash luồng phát video.
                 response
             }
         }
@@ -815,6 +855,10 @@ class Anime47Provider : MainAPI() {
         // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
         // getVideoInterceptor().
         private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
+
+        // Cửa sổ "peek" đủ rộng (~32 gói TS = ~6KB) để tìm byte đồng bộ MPEG-TS (0x47)
+        // mà không cần đọc toàn bộ file — phần rác thường chỉ nằm ở vài trăm byte đầu.
+        private const val TS_SYNC_PEEK_BYTES = 188L * 32
 
         // HIỆU NĂNG: biên dịch 1 lần duy nhất thay vì mỗi lần gọi load() (tức mỗi lần
         // người dùng mở 1 trang chi tiết phim).
