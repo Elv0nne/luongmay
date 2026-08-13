@@ -143,7 +143,7 @@ class Anime47Provider : MainAPI() {
     private val prefs: SharedPreferences?
         get() {
             val activity = CommonActivity.activity ?: return null
-            return activity.getSharedPreferences("anime47_prefs", 0)
+            return activity.getSharedPreferences("anime47_prefs", android.content.Context.MODE_PRIVATE)
         }
 
     override val mainPage: List<MainPageData> = mainPageOf(
@@ -845,5 +845,3 @@ class Anime47Provider : MainAPI() {
         val has_more: Boolean?
     )
 }
- 
- 
