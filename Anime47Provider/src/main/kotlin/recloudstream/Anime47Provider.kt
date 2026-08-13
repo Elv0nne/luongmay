@@ -378,7 +378,6 @@ class Anime47Provider : MainAPI() {
         )
 
         var text = firstResponse.text
-        val hadToken = headers.containsKey("Authorization")
 
         // Token cũ không còn hợp lệ (hết hạn hoặc bị thu hồi) hoặc request trả về mã
         // 401: xoá cache, ép đăng nhập lại một lần rồi thử lại request thay vì bắt
@@ -394,6 +393,12 @@ class Anime47Provider : MainAPI() {
             val staleToken = headers["Authorization"]?.removePrefix("Bearer ")
             val retryHeaders = getAuthHeaders(forceRefresh = true, staleToken = staleToken)
 
+            // Nếu retryHeaders không có Authorization, có 2 khả năng: (a) chưa từng
+            // đăng nhập từ đầu -> giữ nguyên lỗi gốc là đúng ý; hoặc (b) đã có tài
+            // khoản lưu nhưng login lại thất bại thật sự (sai mật khẩu đã lưu, hoặc
+            // mất mạng ngay lúc login) -> cũng không có gì để retry thêm, giữ nguyên
+            // response gốc (text) là lựa chọn hợp lý duy nhất; looksExpiredOrUnauthorized()
+            // bên dưới sẽ bắt lại và báo lỗi rõ ràng cho người dùng trong cả hai trường hợp.
             if (retryHeaders.containsKey("Authorization")) {
                 text = app.get(
                     url,
@@ -401,8 +406,6 @@ class Anime47Provider : MainAPI() {
                     interceptor = interceptor,
                     timeout = 15000
                 ).text
-            } else if (!hadToken) {
-                // Không có tài khoản đã lưu từ đầu (chưa đăng nhập) -> giữ nguyên lỗi gốc.
             }
         }
 
@@ -492,7 +495,11 @@ class Anime47Provider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val animeId = Regex("(\\d+)(?:\\.html|/)?$")
+        // HIỆU NĂNG: dùng animeIdRegex ở cấp companion (biên dịch 1 lần duy nhất khi
+        // class được load) thay vì tạo Regex mới mỗi lần load() được gọi (tức mỗi lần
+        // người dùng mở 1 trang chi tiết phim) — cùng tinh thần tối ưu đã áp dụng cho
+        // cdnFixRegex, tránh chi phí compile regex lặp lại không cần thiết.
+        val animeId = animeIdRegex
             .find(url.trimEnd('/'))
             ?.groupValues
             ?.get(1)
@@ -589,6 +596,16 @@ class Anime47Provider : MainAPI() {
                 this.recommendations = recommendations
                 this.episodes = mutableMapOf(DubStatus.Subbed to episodes)
             }
+        } catch (e: ErrorLoadingException) {
+            // SỬA LỖI: ErrorLoadingException do fetchApi() ném ra khi phát hiện cần
+            // đăng nhập (token hết hạn/không hợp lệ và tự động login lại thất bại)
+            // trước đây bị catch (Exception) bên dưới nuốt mất và bọc lại thành một
+            // IOException chung chung ("Lỗi tải thông tin phim: ..."), làm mất đi
+            // thông báo rõ ràng "Vui lòng mở cài đặt tiện ích để cấu hình tài khoản"
+            // mà CloudStream có thể xử lý/hiển thị khác biệt so với lỗi I/O thông
+            // thường. Cho lỗi này xuyên qua nguyên vẹn, nhất quán với cách getMainPage()
+            // và search() đã xử lý.
+            throw e
         } catch (e: Exception) {
             throw IOException("Lỗi tải thông tin phim: ${e.message}", e)
         }
@@ -771,6 +788,10 @@ class Anime47Provider : MainAPI() {
         // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
         // getVideoInterceptor().
         private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
+
+        // HIỆU NĂNG: biên dịch 1 lần duy nhất thay vì mỗi lần gọi load() (tức mỗi lần
+        // người dùng mở 1 trang chi tiết phim).
+        private val animeIdRegex = Regex("(\\d+)(?:\\.html|/)?$")
 
         // Dùng chung cho mọi instance (Cloudstream chỉ tạo 1 instance provider trong
         // thực tế), cho phép Settings vô hiệu hoá token hiện tại mà không cần giữ tham
