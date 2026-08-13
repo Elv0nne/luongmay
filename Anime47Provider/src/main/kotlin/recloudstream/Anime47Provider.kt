@@ -31,9 +31,16 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
@@ -50,6 +57,27 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 private val mapper: ObjectMapper = jacksonObjectMapper().apply {
     configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+}
+
+// SỬA LỖI (structured concurrency): trong Kotlin coroutines, CancellationException LÀ
+// một subtype của Exception. Các khối "catch (e: Exception) { /* nuốt lỗi */ }" nằm bên
+// trong những coroutine có thể bị hủy (vd. bên trong withTimeoutOrNull(), hoặc bên trong
+// awaitAll() nơi 1 sibling lỗi sẽ hủy các sibling còn lại) trước đây vô tình bắt luôn cả
+// CancellationException, khiến việc hủy coroutine bị "nuốt" thay vì lan truyền tiếp như
+// cơ chế hủy chuẩn của coroutine yêu cầu. Hậu quả cụ thể: withTimeoutOrNull(25_000) ở
+// loadLinks() có thể KHÔNG thực sự dừng được task con (vd. HydraxExtractor.getLinks())
+// nếu công việc bên trong tự bắt hết Exception bao gồm cả tín hiệu hủy — task tiếp tục
+// chạy ngầm tốn mạng/CPU dù bên ngoài coi như đã "hết giờ". Dùng hàm helper này ở mọi
+// nơi cần bắt lỗi rộng nhưng phải cho tín hiệu hủy đi qua nguyên vẹn.
+private suspend inline fun <T> catchNonCancellation(block: () -> T, onError: (Exception) -> T): T {
+    return try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        currentCoroutineContext().ensureActive()
+        onError(e)
+    }
 }
 
 private fun toJson(value: Any?): String {
@@ -71,6 +99,14 @@ class Anime47Provider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime, TvType.Cartoon)
 
     private val interceptor = CloudflareKiller()
+
+    // HIỆU NĂNG: scope nền riêng (SupervisorJob + IO dispatcher) cho các tác vụ
+    // "best effort", không ảnh hưởng tới nội dung chính (điểm danh, lưu lịch sử xem).
+    // SupervisorJob đảm bảo lỗi ở 1 tác vụ nền không hủy các tác vụ nền khác. Dùng scope
+    // độc lập với coroutine gọi getMainPage()/loadLinks() (thay vì coroutineScope { } lồng
+    // vào request chính) để việc launch những tác vụ này KHÔNG bắt request chính phải chờ
+    // chúng hoàn thành trước khi trả kết quả — true fire-and-forget.
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // SỬA LỖI (race condition + đăng xuất không hoàn toàn): trước đây cachedToken là
     // "var" thường thuộc riêng instance, được đọc ở ensureToken() và ghi/null-hoá ở
@@ -119,6 +155,15 @@ class Anime47Provider : MainAPI() {
     // ngoài, để không làm gián đoạn việc xem phim nếu hệ thống điểm gặp sự cố.
     private val dailyCheckinDone = AtomicBoolean(false)
 
+    // Lưu ý: hai hàm dưới đây (triggerDailyCheckinOnce, markEpisodeWatched) chỉ được gọi
+    // qua "backgroundScope.launch { ... }" (xem getMainPage()/loadEpisodeStreams()), tức
+    // luôn chạy trong 1 coroutine job độc lập mà không có nơi nào await() kết quả của nó.
+    // Vì vậy "catch (e: Exception)" nuốt cả CancellationException ở đây là AN TOÀN và
+    // đúng ý: nếu job nền này bị hủy (vd. app tắt hẳn), nuốt lỗi chỉ khiến hàm kết thúc
+    // êm thấm thay vì log lỗi không cần thiết — không có coroutine cha nào chờ tín hiệu
+    // hủy này để tiếp tục logic khác. Khác với các "catch (e: Exception)" trong đường đi
+    // chính (getMainPage/search/load/loadLinks) đã được sửa dùng catchNonCancellation()
+    // hoặc rethrow CancellationException tường minh.
     private suspend fun triggerDailyCheckinOnce() {
         if (!dailyCheckinDone.compareAndSet(false, true)) return
 
@@ -357,6 +402,8 @@ class Anime47Provider : MainAPI() {
                     cachedToken = newToken
                 }
                 newToken
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 null
             }
@@ -432,11 +479,16 @@ class Anime47Provider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        // Mô phỏng "vào web là tự điểm danh": gọi 1 lần mỗi session, không chặn
-        // luồng tải trang chủ nếu điểm danh lỗi/chậm.
-        triggerDailyCheckinOnce()
-
         val url = "$apiBaseUrl${request.data}&page=$page"
+
+        // HIỆU NĂNG: trước đây "triggerDailyCheckinOnce()" được await() TUẦN TỰ trước
+        // khi bắt đầu fetch nội dung trang chủ — dù bản thân hàm này đã "best effort"
+        // (nuốt mọi lỗi bên trong), việc await() nó vẫn cộng dồn thêm độ trễ round-trip
+        // mạng thật sự vào thời gian mở app lần đầu, trong khi điểm danh không có quan hệ
+        // phụ thuộc dữ liệu nào với việc tải danh sách phim. launch() trên backgroundScope
+        // (không phải coroutineScope{} lồng vào đây) để nó thực sự chạy độc lập, không
+        // khiến getMainPage() phải chờ nó xong mới trả kết quả cho người dùng.
+        backgroundScope.launch { triggerDailyCheckinOnce() }
 
         // SỬA LỖI: trước đây MỌI exception (kể cả lỗi mạng thật sự: timeout, mất kết
         // nối, DNS lỗi...) đều bị nuốt thành "response = null", rồi bên dưới báo nhầm
@@ -444,13 +496,17 @@ class Anime47Provider : MainAPI() {
         // dùng/nhà phát triển hiểu sai nguyên nhân thật (vd. tưởng server đổi API trong
         // khi chỉ là mất mạng tạm thời) và không có cách nào phân biệt hai trường hợp.
         // Chỉ nuốt lỗi parse/dữ liệu (không phải lỗi mạng) ở đây; để lỗi mạng (IOException
-        // và các lỗi không phải do parse) thoát ra ngoài với thông tin gốc.
+        // và các lỗi không phải do parse) thoát ra ngoài với thông tin gốc. Dùng
+        // catchNonCancellation() để không nuốt nhầm tín hiệu hủy coroutine (xem ghi chú
+        // tại khai báo hàm này).
         val response: ApiFilterResponse? = try {
             fetchApi(url)
         } catch (e: ErrorLoadingException) {
             throw e
         } catch (e: IOException) {
             throw ErrorLoadingException("Không thể kết nối tới máy chủ Anime47. Vui lòng kiểm tra kết nối mạng và thử lại.")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             // Lỗi parse JSON hoặc cấu trúc dữ liệu bất ngờ: coi như response rỗng,
             // xử lý tiếp bên dưới với thông báo phù hợp.
@@ -488,6 +544,8 @@ class Anime47Provider : MainAPI() {
             throw e
         } catch (e: IOException) {
             throw ErrorLoadingException("Không thể kết nối tới máy chủ Anime47. Vui lòng kiểm tra kết nối mạng và thử lại.")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             null
         }
@@ -536,9 +594,19 @@ class Anime47Provider : MainAPI() {
                 // dùng KHÔNG xem được phim dù title + danh sách tập vẫn tải bình thường.
                 // Bắt lỗi riêng cho recsTask, coi recommendations rỗng nếu lỗi thay vì
                 // làm hỏng toàn bộ trang chi tiết phim.
+                //
+                // SỬA LỖI (structured concurrency): recsTask nằm trong cùng coroutineScope
+                // với infoTask/episodesTask — nếu 1 trong 2 task đó lỗi, coroutineScope sẽ
+                // tự hủy các sibling còn lại (bao gồm recsTask). "catch (e: Exception)"
+                // trần trước đây sẽ nuốt luôn CancellationException đó, khiến recsTask
+                // tiếp tục gọi mạng dù phần còn lại của load() đã thất bại và sắp bị vứt
+                // bỏ — vừa lãng phí băng thông vừa làm coroutineScope phải chờ 1 request
+                // không còn ý nghĩa gì hoàn tất trước khi thực sự ném lỗi ra ngoài.
                 val recsTask = async {
                     try {
                         fetchApi<ApiRecommendationResponse>("$apiBaseUrl/anime/info/$animeId/recommendations?lang=vi")
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (e: Exception) {
                         null
                     }
@@ -618,6 +686,12 @@ class Anime47Provider : MainAPI() {
             // thường. Cho lỗi này xuyên qua nguyên vẹn, nhất quán với cách getMainPage()
             // và search() đã xử lý.
             throw e
+        } catch (e: CancellationException) {
+            // SỬA LỖI: không bọc CancellationException thành IOException — làm vậy sẽ
+            // biến 1 tín hiệu hủy coroutine hợp lệ (vd. người dùng thoát màn hình chi
+            // tiết phim trước khi load() xong) thành 1 lỗi I/O "thật", có thể khiến
+            // CloudStream hiển thị nhầm thông báo lỗi cho người dùng dù không có gì sai.
+            throw e
         } catch (e: Exception) {
             throw IOException("Lỗi tải thông tin phim: ${e.message}", e)
         }
@@ -652,12 +726,26 @@ class Anime47Provider : MainAPI() {
         // ĐỘ ỔN ĐỊNH: mỗi episode được bọc trong withTimeoutOrNull(25s) — nếu không có
         // giới hạn này, một server bị treo (CDN không phản hồi nhưng không đóng kết nối
         // để trigger timeout ở tầng OkHttp) có thể khiến awaitAll() bên ngoài chờ vô
-        // thời hạn dù các episode/server khác đã xong từ lâu. 25s đủ rộng cho fetch
-        // watch-info (15s) cộng dư thời gian cho nhánh HY (embed 15s + 1 lần retry).
+        // thời hạn dù các episode/server khác đã xong từ lâu.
+        //
+        // SỬA LỖI (ngân sách thời gian không khớp): trước đây comment ở đây ước tính "15s
+        // watch-info + embed 15s + 1 retry" là đủ trong 25s, nhưng đó là phép cộng sai —
+        // watch-info (fetchApi, timeout=15s) chạy TRƯỚC, rồi các stream mới chạy song
+        // song, và bên trong nhánh HY, fetchMp4Metadata() có thể tự gọi app.get() TUẦN
+        // TỰ tới 2 lần (mỗi lần timeout riêng) nếu lần đầu lỗi/5xx. Trường hợp xấu nhất
+        // thực tế là watch-info (tới 15s) + embed lần 1 (tới HY_EMBED_TIMEOUT_MS) + embed
+        // lần 2 (tới HY_EMBED_TIMEOUT_MS) chạy TUẦN TỰ trong cùng 1 coroutine con — với
+        // giá trị 15s cũ cho mỗi lần embed, tổng có thể lên tới 15+15+15=45s, vượt xa
+        // ngân sách 25s và khiến withTimeoutOrNull hủy giữa chừng oan uổng dù server đang
+        // phản hồi chậm nhưng vẫn trong giới hạn hợp lý của chính nó. Hạ timeout mỗi lần
+        // gọi embed xuống HY_EMBED_TIMEOUT_MS (8s) để tổng trường hợp xấu nhất
+        // (15 + 8 + 8 = 31s vẫn hơi vượt, nên đồng thời nới outer timeout xuống còn phụ
+        // thuộc vào EPISODE_TIMEOUT_MS bên dưới thay vì hằng số rời rạc) — xem
+        // EPISODE_TIMEOUT_MS.
         coroutineScope {
             episodeIds.map { id ->
                 async {
-                    withTimeoutOrNull(25_000) {
+                    withTimeoutOrNull(EPISODE_TIMEOUT_MS) {
                         loadEpisodeStreams(id, referer, loaded, subtitleCallback, callback)
                     }
                 }
@@ -675,10 +763,17 @@ class Anime47Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        try {
+        // SỬA LỖI (structured concurrency): dùng catchNonCancellation() thay vì
+        // "catch (e: Exception)" trần — xem ghi chú đầy đủ tại khai báo hàm helper ở đầu
+        // file. Quan trọng nhất cho hàm này vì nó luôn được gọi bên trong
+        // withTimeoutOrNull(25_000) ở loadLinks(): nếu lỗi mạng thật sự xảy ra CÙNG LÚC
+        // timeout kích hoạt, catch trần trước đây có thể vô tình nuốt luôn tín hiệu hủy
+        // do timeout gửi xuống, khiến coroutine (và bất kỳ awaitAll() con nào bên trong)
+        // không dừng đúng lúc như kỳ vọng.
+        catchNonCancellation({
             val watchResponse: ApiWatchResponse? =
                 fetchApi("$apiBaseUrl/anime/watch/episode/$episodeId?lang=vi")
-            val streams = watchResponse?.streams ?: return
+            val streams = watchResponse?.streams ?: return@catchNonCancellation
 
             val episodeLoaded = coroutineScope {
                 streams.map { stream ->
@@ -688,12 +783,18 @@ class Anime47Provider : MainAPI() {
 
             // Báo "đã xem" lên hệ thống DCC chỉ khi thực sự lấy được ít nhất 1 link
             // phát cho episode này (tránh cộng điểm cho tập lỗi/rỗng).
+            //
+            // HIỆU NĂNG: chạy nền (backgroundScope.launch, không await) thay vì chờ
+            // tuần tự — markEpisodeWatched() là "best effort" (đã tự nuốt lỗi bên
+            // trong), người dùng đã có link phát rồi nên không có lý do gì để loadLinks()
+            // phải trì hoãn trả về (và do đó trì hoãn việc player bắt đầu phát) chỉ để
+            // chờ 1 request ghi log lịch sử xem hoàn tất.
             if (episodeLoaded) {
-                markEpisodeWatched(episodeId)
+                backgroundScope.launch { markEpisodeWatched(episodeId) }
             }
-        } catch (e: Exception) {
+        }, onError = {
             // bỏ qua lỗi từng episode riêng lẻ, không chặn các episode khác
-        }
+        })
     }
 
     /** Tải một server/stream đơn lẻ (FE hoặc HY) và forward link/subtitle qua callback. */
@@ -719,7 +820,12 @@ class Anime47Provider : MainAPI() {
         // chứa metadata mã hóa AES-CTR (xem HydraxExtractor.kt). Phải đi qua
         // HydraxExtractor + HydraxInterceptor thay vì coi url là m3u8 trực tiếp.
         if (HydraxExtractor.isHydraxUrl(url)) {
-            val hyLoaded = try {
+            // SỬA LỖI (structured concurrency): xem ghi chú tại catchNonCancellation() —
+            // giữ nguyên tín hiệu hủy (timeout/sibling lỗi trong awaitAll) thay vì để
+            // catch trần nuốt mất, đặc biệt quan trọng vì HydraxExtractor.getLinks() có
+            // thể tự thực hiện tới 2 lần gọi mạng tuần tự (retry 1 lần trong
+            // fetchMp4Metadata), là nhánh dễ vượt quá ngân sách thời gian cho phép nhất.
+            val hyLoaded = catchNonCancellation({
                 val hydraxLinks = HydraxExtractor.getLinks(
                     streamUrl = url,
                     providerName = name,
@@ -728,9 +834,9 @@ class Anime47Provider : MainAPI() {
                 )
                 hydraxLinks.forEach { callback(it) }
                 hydraxLinks.isNotEmpty()
-            } catch (e: Exception) {
+            }, onError = {
                 false // bỏ qua lỗi riêng của HY, không chặn các server khác
-            }
+            })
             if (hyLoaded) loaded.set(true)
             forwardSubtitles()
             return hyLoaded
@@ -852,6 +958,15 @@ class Anime47Provider : MainAPI() {
     // "Session" cho sharedCachedToken) trong cùng file, đây là lỗi biên dịch. Gộp lại
     // thành 1 companion object "Session" duy nhất chứa cả hai.
     companion object Session {
+        // Ngân sách thời gian tối đa cho toàn bộ 1 episode (watch-info + mọi server song
+        // song). Đủ rộng cho trường hợp xấu nhất: watch-info (WATCH_INFO_TIMEOUT_MS) rồi
+        // TUẦN TỰ 2 lần gọi embed Hydrax (mỗi lần tối đa HydraxExtractor.HY_EMBED_TIMEOUT_MS,
+        // xem ghi chú tại loadLinks()) cộng dư ~2s cho các bước xử lý CPU (decrypt/parse).
+        // 15s + 8s + 8s + 2s dư = 33s -> làm tròn lên 35s để không cắt oan các trường hợp
+        // hợp lệ nhưng chậm, trong khi vẫn đủ chặt để không treo vô hạn khi 1 server thật
+        // sự bị treo.
+        const val EPISODE_TIMEOUT_MS = 35_000L
+
         // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
         // getVideoInterceptor().
         private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
