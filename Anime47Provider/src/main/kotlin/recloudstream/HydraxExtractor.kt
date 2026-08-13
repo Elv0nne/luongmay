@@ -16,6 +16,7 @@ package recloudstream
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -46,6 +47,18 @@ object HydraxExtractor {
     private val mapper = jacksonObjectMapper()
     const val RELAY_HOST = "hydrax-relay.internal"
     private const val ABYSS_BASE_URL = "https://abysscdn.com"
+
+    // SỬA LỖI (nhất quán/độ tin cậy): mọi request khác trong plugin (getMainPage, search,
+    // load, fetchApi, markEpisodeWatched...) đều truyền interceptor = CloudflareKiller()
+    // của Anime47Provider để tự động vượt qua trang thách thức Cloudflare (challenge page)
+    // nếu domain bật bảo vệ này. Request lấy trang embed Abyss (fetchMp4Metadata) trước đây
+    // KHÔNG có interceptor nào — nếu abysscdn.com/playhydrax.com/zplayer.io bật Cloudflare
+    // (rất phổ biến với CDN video lậu/free để chống bot), response trả về sẽ là trang HTML
+    // challenge thay vì trang embed thật, khiến datasRegex không khớp được gì và getLinks()
+    // luôn trả về rỗng cho toàn bộ server HY — âm thầm "server HY không có link" trong khi
+    // nguyên nhân thực sự là chưa vượt được Cloudflare. Instance CloudflareKiller là
+    // stateless/an toàn khi tái sử dụng nhiều lần, nên tạo 1 lần duy nhất ở cấp object.
+    private val cloudflareKiller = CloudflareKiller()
 
     // HIỆU NĂNG: biên dịch 1 lần duy nhất khi object được load (Kotlin "object" là
     // singleton) thay vì mỗi lần gọi fetchMp4Metadata() — tức mỗi lần lấy link cho
@@ -156,6 +169,7 @@ object HydraxExtractor {
                 "Referer" to referer,
                 "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
             ),
+            interceptor = cloudflareKiller,
             timeout = 15000
         )
 
@@ -254,10 +268,16 @@ object HydraxInterceptor : Interceptor {
     // Connection pool lớn hơn mặc định (5) để giữ kết nối tới CDN sống lâu hơn giữa các
     // segment request liên tiếp và cho prefetch chạy song song, tránh phải bắt tay TLS
     // lại từ đầu mỗi lần — đây là phần đóng góp lớn vào độ trễ "chờ lấy link stream lâu".
+    // HIỆU NĂNG/ĐỘ ỔN ĐỊNH: bật retryOnConnectionFailure (mặc định OkHttp đã là true,
+    // nhưng khai báo tường minh để không phụ thuộc vào default có thể đổi giữa các
+    // version OkHttp) để tự động thử lại khi TLS handshake/route thất bại tạm thời
+    // (rất thường gặp với CDN video free load cao, hay bị rớt kết nối giữa chừng) —
+    // giảm số lần player phải tự retry toàn bộ request từ đầu, giúp luồng phát mượt hơn.
     private val client = OkHttpClient.Builder()
         .connectionPool(okhttp3.ConnectionPool(8, 60, java.util.concurrent.TimeUnit.SECONDS))
         .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     // HIỆU NĂNG: trước đây mỗi SegmentSource (tức mỗi request video/mỗi lần player mở
@@ -435,8 +455,20 @@ object HydraxInterceptor : Interceptor {
 
             // Chưa có sẵn trong buffer/cache: đọc trực tiếp (streaming) từ kết nối HTTP,
             // mở kết nối mới nếu chưa có hoặc đã chuyển sang segment khác.
+            //
+            // SỬA LỖI (hiệu năng bộ đệm đọc): trước đây `remaining` tính tới
+            // endByteInclusive — tức ranh giới của TOÀN BỘ Range mà player yêu cầu, có thể
+            // trải dài qua nhiều segment 2MB. Vì openSource chỉ là 1 kết nối HTTP tới ĐÚNG
+            // 1 segment hiện tại, việc xin đọc `wantToRead` lớn hơn phần dữ liệu còn lại
+            // thực sự có trong segment đó không sai về mặt kết quả (Okio Source.read() chỉ
+            // trả về tối đa số byte có sẵn), nhưng khiến Okio phải cấp phát/chuẩn bị bộ đệm
+            // lớn hơn cần thiết cho mỗi lần gọi read() ở gần cuối segment. Giới hạn thêm
+            // theo `segEndExclusive` (ranh giới thật của segment đang đọc) để mỗi lần đọc
+            // luôn khớp đúng với lượng dữ liệu còn lại trong kết nối đang mở.
             val remaining = endByteInclusive - currentPos + 1
-            val wantToRead = minOf(byteCount, remaining, FRAGMENT_SIZE)
+            val segEndExclusive = minOf(segStart + FRAGMENT_SIZE, endByteInclusive + 1)
+            val remainingInSegment = segEndExclusive - currentPos
+            val wantToRead = minOf(byteCount, remaining, remainingInSegment, FRAGMENT_SIZE)
 
             // SỬA LỖI: Source.skip() của Okio có thể ném IOException nếu kết nối kết
             // thúc/bị gián đoạn trước khi skip đủ số byte yêu cầu (ví dụ server đóng kết
@@ -493,7 +525,6 @@ object HydraxInterceptor : Interceptor {
             // cách so sánh currentPos với ranh giới segment: nếu chưa tới ranh giới mà đã
             // -1, thử mở lại kết nối đúng 1 lần trước khi coi là lỗi thật.
             if (read <= 0) {
-                val segEndExclusive = minOf(segStart + FRAGMENT_SIZE, endByteInclusive + 1)
                 val genuinelyAtSegmentEnd = currentPos >= segEndExclusive
                 if (!genuinelyAtSegmentEnd) {
                     closeOpenConnection()
