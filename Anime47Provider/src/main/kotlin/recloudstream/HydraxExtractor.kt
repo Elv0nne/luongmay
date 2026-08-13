@@ -163,20 +163,30 @@ object HydraxExtractor {
 
     private suspend fun fetchMp4Metadata(videoId: String, referer: String): Mp4Data? {
         val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
-        val response = app.get(
-            embedUrl,
-            headers = mapOf(
-                "Referer" to referer,
-                "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-            ),
-            interceptor = cloudflareKiller,
-            timeout = 15000
+        val headers = mapOf(
+            "Referer" to referer,
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         )
 
-        // Fail sớm và rõ ràng nếu Abyss trả lỗi HTTP (404/5xx/rate-limit...) thay vì
-        // để regex bên dưới âm thầm không tìm thấy "datas" và trả null mập mờ — phân
-        // biệt được "trang embed lỗi" với "trang hợp lệ nhưng đổi cấu trúc HTML".
-        if (!response.isSuccessful) return null
+        // HIỆU NĂNG/ĐỘ ỔN ĐỊNH: CDN embed (abysscdn.com) đôi khi trả lỗi 5xx/timeout
+        // thoáng qua dưới tải cao. Thử lại tối đa 1 lần (tổng 2 lần gọi) trước khi coi
+        // là thất bại thật — giảm tỷ lệ "server HY không có link" giả do mạng chập chờn
+        // thay vì lỗi thật sự từ phía Abyss.
+        var response = runCatching {
+            app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
+        }.getOrNull()
+
+        if (response == null || !response.isSuccessful) {
+            response = runCatching {
+                app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
+            }.getOrNull()
+        }
+
+        // Fail sớm và rõ ràng nếu Abyss trả lỗi HTTP (404/5xx/rate-limit...) hoặc lỗi
+        // mạng cả 2 lần thử, thay vì để regex bên dưới âm thầm không tìm thấy "datas"
+        // và trả null mập mờ — phân biệt được "trang embed lỗi" với "trang hợp lệ
+        // nhưng đổi cấu trúc HTML".
+        if (response == null || !response.isSuccessful) return null
         val html = response.text
 
         // HIỆU NĂNG: trước đây dùng Jsoup.parse() để dựng toàn bộ cây DOM của trang embed
@@ -188,15 +198,23 @@ object HydraxExtractor {
         val encodedDatas = datasRegex.find(html)
             ?.groupValues?.get(1) ?: return null
 
-        val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
-        val datas = mapper.readValue(decodedJson, Datas::class.java)
-        val encryptedMedia = datas.media ?: return null
+        // SỬA LỖI (ổn định): decode/giải mã/parse JSON có thể ném exception nếu trang
+        // embed đổi cấu trúc payload (base64 hỏng, AES key sai do thiếu field, JSON
+        // không hợp lệ). Trước đây không có try-catch riêng ở đây khiến lỗi này thoát
+        // thẳng khỏi fetchMp4Metadata() dưới dạng exception khó phân biệt với lỗi mạng;
+        // caller (getLinks) vẫn bọc catch chung nên không crash app, nhưng coi việc này
+        // là "không lấy được metadata" (trả null) là hành vi rõ ràng và nhất quán hơn.
+        return runCatching {
+            val decodedJson = String(Base64.getDecoder().decode(encodedDatas), Charsets.ISO_8859_1)
+            val datas = mapper.readValue(decodedJson, Datas::class.java)
+            val encryptedMedia = datas.media ?: return@runCatching null
 
-        val mediaKey = keyForString("${datas.user_id}:${datas.slug}:${datas.md5_id}")
-        val decryptedJson = aesCtrDecryptFromIso(encryptedMedia, mediaKey)
-        val video = mapper.readValue(decryptedJson, VideoData::class.java)
+            val mediaKey = keyForString("${datas.user_id}:${datas.slug}:${datas.md5_id}")
+            val decryptedJson = aesCtrDecryptFromIso(encryptedMedia, mediaKey)
+            val video = mapper.readValue(decryptedJson, VideoData::class.java)
 
-        return video.mp4?.copy(slug = datas.slug, md5_id = datas.md5_id)
+            video.mp4?.copy(slug = datas.slug, md5_id = datas.md5_id)
+        }.getOrNull()
     }
 
     // ===================== public API =====================
@@ -292,7 +310,11 @@ object HydraxInterceptor : Interceptor {
     // newFixedThreadPool) để pool không bao giờ ngăn JVM/app thoát hoặc "treo" tiến
     // trình nếu vòng đời plugin không gọi tới việc dọn executor này. Non-daemon threads
     // giữ ứng dụng chạy ngầm ngay cả khi mọi hoạt động thực sự đã kết thúc.
-    private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(3) { runnable ->
+    // HIỆU NĂNG: nâng từ 3 lên 4 thread để khớp hơn với ConnectionPool(8, ...) phía
+    // trên — vẫn chừa đủ chỗ trong pool cho các kết nối "đọc trực tiếp" (không phải
+    // prefetch) của nhiều SegmentSource hoạt động đồng thời (vd. nhiều tập tải song
+    // song), tránh tranh chấp kết nối khiến cả prefetch lẫn đọc trực tiếp đều chậm lại.
+    private val prefetchExecutor = java.util.concurrent.Executors.newFixedThreadPool(4) { runnable ->
         Thread(runnable, "hydrax-prefetch").apply { isDaemon = true }
     }
 
@@ -358,11 +380,15 @@ object HydraxInterceptor : Interceptor {
     }
 
     private fun errorResponse(request: Request, code: Int, message: String): Response {
+        // SỬA LỖI: thêm Content-Length: 0 tường minh. Một số player/thư viện HTTP đọc
+        // strict có thể xử lý sai (chờ vô hạn hoặc lỗi parse) với response không có
+        // Content-Length lẫn Transfer-Encoding rõ ràng, dù body rỗng.
         return Response.Builder()
             .request(request)
             .protocol(Protocol.HTTP_1_1)
             .code(code)
             .message(message)
+            .header("Content-Length", "0")
             .body("".toResponseBody(null))
             .build()
     }
@@ -412,6 +438,16 @@ object HydraxInterceptor : Interceptor {
         // Dùng chung executor singleton của HydraxInterceptor thay vì tạo pool riêng cho
         // mỗi SegmentSource (xem ghi chú tại nơi khai báo prefetchExecutor phía trên).
         private val prefetchExecutor = HydraxInterceptor.prefetchExecutor
+
+        // SỬA LỖI (rò rỉ tài nguyên): schedulePrefetch() trước đây gọi
+        // prefetchExecutor.submit {} mà KHÔNG lưu lại Future trả về. Khi close() được
+        // gọi (player chuyển tập, seek liên tục tạo Source mới, hoặc dừng phát giữa
+        // chừng), các task prefetch ĐANG chạy trong background vẫn tiếp tục tải segment
+        // 2MB từ CDN dù không còn ai tiêu thụ dữ liệu đó nữa — lãng phí băng thông mạng
+        // và giữ pool bận rộn không cần thiết, ảnh hưởng tới các SegmentSource khác đang
+        // hoạt động cùng lúc (chia sẻ chung executor). Theo dõi các Future đang chạy để
+        // có thể hủy (cancel) chúng ngay khi close().
+        private val prefetchFutures = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.Future<*>>()
 
         // Kết nối HTTP đang mở cho segment hiện tại (đọc dần, KHÔNG tải hết vào RAM
         // trước khi trả cho player — xem ghi chú ở đầu class).
@@ -571,7 +607,13 @@ object HydraxInterceptor : Interceptor {
         override fun timeout(): Timeout = Timeout.NONE
         override fun close() {
             closeOpenConnection()
-            // KHÔNG shutdown prefetchExecutor ở đây nữa: nó là pool dùng chung (singleton)
+            // SỬA LỖI (rò rỉ tài nguyên): hủy mọi prefetch task còn đang chạy trước khi
+            // dọn state — xem ghi chú đầy đủ tại khai báo prefetchFutures phía trên.
+            // interrupt=true để ngắt cả request HTTP đang chờ phản hồi (blocking I/O),
+            // không chỉ các task còn nằm trong hàng đợi chưa bắt đầu.
+            prefetchFutures.values.forEach { it.cancel(true) }
+            prefetchFutures.clear()
+            // KHÔNG shutdown prefetchExecutor ở đây: nó là pool dùng chung (singleton)
             // cho mọi segment/video, không thuộc riêng instance này. Chỉ dọn cache/trạng
             // thái của riêng SegmentSource này.
             prefetchCache.clear()
@@ -625,7 +667,7 @@ object HydraxInterceptor : Interceptor {
             if (prefetchCache.size >= maxPrefetchCacheEntries) return
             if (!prefetchInFlight.add(nextIndex)) return
 
-            prefetchExecutor.submit {
+            val future = prefetchExecutor.submit {
                 try {
                     val bytes = fetchSegment(nextIndex)
                     if (bytes.isNotEmpty() && prefetchCache.size < maxPrefetchCacheEntries) {
@@ -633,8 +675,10 @@ object HydraxInterceptor : Interceptor {
                     }
                 } finally {
                     prefetchInFlight.remove(nextIndex)
+                    prefetchFutures.remove(nextIndex)
                 }
             }
+            prefetchFutures[nextIndex] = future
         }
 
         /** Tải trọn segment vào RAM — dùng riêng cho prefetch chạy nền (không cần độ trễ thấp). */
