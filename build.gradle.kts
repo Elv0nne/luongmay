@@ -39,35 +39,6 @@ subprojects {
     cloudstream {
         // when running through github workflow, GITHUB_REPOSITORY should contain current repository name
         setRepo(System.getenv("GITHUB_REPOSITORY") ?: "Elv0nne/uhnimefourseven")
-
-        // QUAN TRỌNG: cloudstream Gradle plugin (com.github.recloudstream:gradle) tự
-        // tải "cloudstream.jar" (dùng làm compileOnly stub, KHÁC với dependency
-        // "cloudstream(...)" khai báo bên dưới trong khối dependencies{}, cái đó chỉ
-        // ảnh hưởng tới coordinate JitPack cho phần khác) từ URL HARDCODE trong chính
-        // source của plugin:
-        //   ApkInfo.urlPrefix mặc định = "https://github.com/recloudstream/cloudstream/releases/download/${version}"
-        // (xem CloudstreamExtension.kt + CloudstreamConfigurationProvider.kt trong
-        // repo recloudstream/gradle). URL này LUÔN trỏ về repo GỐC
-        // recloudstream/cloudstream, bất kể coordinate JitPack mình khai báo là gì —
-        // đây là lý do bản build trước lỗi 404 vào
-        // ".../recloudstream/cloudstream/releases/download/9b9ae65/classes.jar"
-        // (release "9b9ae65" không tồn tại ở repo GỐC, vì đó là commit hash bên FORK
-        // của mình).
-        //
-        // overrideUrlPrefix() ghi đè urlPrefix đó, trỏ sang GitHub Release thật của
-        // fork Elv0nne/cloudstream — release này đã tồn tại (workflow "Pre-release"
-        // trong fork tự tạo/update GitHub Release tag "pre-release" mỗi lần push lên
-        // master, đính kèm đúng file "classes.jar" cần thiết, xem
-        // .github/workflows/prerelease.yml). Kết quả: plugin sẽ tải
-        // "https://github.com/Elv0nne/cloudstream/releases/download/pre-release/classes.jar"
-        // — ĐÚNG bản đã patch WatchProgressListener.
-        //
-        // LƯU Ý: dùng tag "pre-release" ở đây (khác với commit hash "9b9ae65" dùng
-        // cho coordinate JitPack bên dưới) vì GitHub Release attach file theo TAG,
-        // không theo commit hash — và workflow luôn move tag "pre-release" tới commit
-        // mới nhất trên master mỗi lần push, nên nó tự động theo kịp các patch sau
-        // này miễn là bạn đã push code mới lên fork trước khi build plugin.
-        overrideUrlPrefix("https://github.com/Elv0nne/cloudstream/releases/download/pre-release")
     }
 
     android {
@@ -100,28 +71,8 @@ subprojects {
         val cloudstream by configurations
         val implementation by configurations
 
-        // Stubs for all cloudstream classes.
-        //
-        // ĐÃ SỬA: trỏ sang bản fork đã patch (thêm WatchProgressListener vào
-        // MainAPI.kt + forward vị trí phát thật trong GeneratorPlayer.kt) thay vì
-        // "com.lagradost:cloudstream3:pre-release" chính thức — bản chính thức
-        // KHÔNG có interface WatchProgressListener nên biên dịch sẽ lỗi
-        // "Unresolved reference 'WatchProgressListener'".
-        //
-        // XÁC NHẬN THẬT qua JitPack build log (2026-08-14): coordinate
-        // "com.github.Elv0nne.cloudstream:library:9b9ae65" build SUCCESSFUL, publish
-        // đúng 3 artifact (library, library-jvm, library-android) — dùng thẳng
-        // "library" để Gradle/cloudstream plugin tự chọn đúng variant (android/jvm)
-        // theo target đang build, không cần chỉ định hậu tố thủ công.
-        //
-        // Dùng version cố định là commit hash "9b9ae65" (không dùng tag "pre-release"
-        // vì tag đó bị MOVE lại mỗi lần push mới lên Elv0nne/cloudstream, không đảm
-        // bảo luôn trỏ đúng bản đã build-verify này). Nếu sau này patch thêm code
-        // trên fork, thay "9b9ae65" bằng commit hash mới, rồi tự verify lại qua
-        // https://jitpack.io/#Elv0nne/cloudstream/<commit-hash> (bấm "Get it", đợi
-        // "BUILD SUCCESSFUL") trước khi build plugin, để tránh build lỗi hoặc dùng
-        // nhầm bản jitpack cache cũ.
-        cloudstream("com.github.Elv0nne.cloudstream:library:9b9ae65")
+        // Stubs for all cloudstream classes
+        cloudstream("com.lagradost:cloudstream3:pre-release")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
