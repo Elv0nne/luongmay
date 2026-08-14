@@ -21,6 +21,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.Dispatcher
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
@@ -59,6 +60,37 @@ object HydraxExtractor {
     // nguyên nhân thực sự là chưa vượt được Cloudflare. Instance CloudflareKiller là
     // stateless/an toàn khi tái sử dụng nhiều lần, nên tạo 1 lần duy nhất ở cấp object.
     private val cloudflareKiller = CloudflareKiller()
+
+    // SỬA LỖI (nghiêm trọng — HY treo kéo theo cả FE): CloudflareKiller.intercept() chạy
+    // `runBlocking { bypassCloudflare(...) }`, và khi domain trả 403/503 kèm header
+    // Cloudflare, bypassCloudflare() mở WebViewResolver(...).resolveUsingWebView(url) rồi
+    // CHỜ tới DEFAULT_TIMEOUT = 60_000L (60 giây, xem WebViewResolver trong app core) nếu
+    // WebView không tự thoát sớm hơn. Vấn đề: request app.get(embedUrl, interceptor =
+    // cloudflareKiller, ...) ở fetchMp4Metadata() bên dưới trước đây chạy trên
+    // `app` mặc định — tức dùng chung app.baseClient, một OkHttpClient SINGLETON cho TOÀN
+    // BỘ ứng dụng (mọi provider, mọi extractor, kể cả server FE của chính Anime47Provider
+    // và mọi provider khác đang cài). app.baseClient không tự cấu hình Dispatcher riêng,
+    // nên áp dụng dispatcher mặc định của OkHttp (maxRequests = 64 toàn app, maxRequestsPerHost
+    // = 5). Khi runBlocking bên trong CloudflareKiller giữ chặt 1 thread I/O của dispatcher
+    // DÙNG CHUNG này trong lúc chờ WebView (tối đa 60s), mọi request khác đi qua cùng
+    // dispatcher — kể cả bấm sang server FE ngay sau khi HY lỗi — phải xếp hàng chờ, tạo
+    // đúng hiện tượng "bấm HY lỗi rồi bấm FE cũng lỗi/treo theo".
+    //
+    // Fix: cấp cho HydraxExtractor một OkHttpClient RIÊNG, có Dispatcher RIÊNG (thread pool
+    // độc lập với app.baseClient), chỉ dùng cho các request đi qua cloudflareKiller của HY.
+    // Dù runBlocking vẫn giữ 1 thread trong pool riêng này tới 60s khi gặp Cloudflare
+    // challenge thật, nó không còn thể làm nghẽn dispatcher dùng chung cho FE/các provider
+    // khác nữa — lỗi (nếu có) chỉ còn cô lập trong phạm vi HY.
+    private val hydraxDispatcher = Dispatcher().apply {
+        // Pool nhỏ là đủ: chỉ HydraxExtractor dùng client này, và số request HY chạy
+        // song song trong 1 lượt loadLinks() hiếm khi vượt quá vài chục (số tập x số
+        // server HY của mỗi tập).
+        maxRequests = 16
+        maxRequestsPerHost = 8
+    }
+    private val hydraxClient = OkHttpClient.Builder()
+        .dispatcher(hydraxDispatcher)
+        .build()
 
     // HIỆU NĂNG: biên dịch 1 lần duy nhất khi object được load (Kotlin "object" là
     // singleton) thay vì mỗi lần gọi fetchMp4Metadata() — tức mỗi lần lấy link cho
@@ -169,6 +201,28 @@ object HydraxExtractor {
         }
     }
 
+    /**
+     * Thực hiện GET qua hydraxClient (dispatcher/thread pool RIÊNG, không phải
+     * app.baseClient dùng chung) nhưng vẫn áp dụng cloudflareKiller để tự vượt challenge
+     * nếu abysscdn.com/playhydrax.com/zplayer.io bật Cloudflare. Xem ghi chú tại khai báo
+     * hydraxClient/hydraxDispatcher ở trên: đây là điểm mấu chốt cô lập HY khỏi FE.
+     */
+    private fun hydraxGet(url: String, headers: Map<String, String>, timeoutMs: Long): Response {
+        val requestBuilder = Request.Builder().url(url)
+        headers.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
+        val request = requestBuilder.build()
+
+        val callClient = hydraxClient.newBuilder()
+            .callTimeout(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            // cloudflareKiller.intercept() tự runBlocking + tự chain.proceed(), nên gắn
+            // như một application interceptor bình thường của hydraxClient là đủ — nó sẽ
+            // chạy TRÊN thread pool riêng của hydraxDispatcher, không phải của app.baseClient.
+            .addInterceptor(cloudflareKiller)
+            .build()
+
+        return callClient.newCall(request).execute()
+    }
+
     private suspend fun fetchMp4Metadata(videoId: String, referer: String): Mp4Data? {
         val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
         val headers = mapOf(
@@ -180,22 +234,33 @@ object HydraxExtractor {
         // thoáng qua dưới tải cao. Thử lại tối đa 1 lần (tổng 2 lần gọi) trước khi coi
         // là thất bại thật — giảm tỷ lệ "server HY không có link" giả do mạng chập chờn
         // thay vì lỗi thật sự từ phía Abyss.
-        var response = runCatching {
-            app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
-        }.getOrNull()
+        //
+        // SỬA LỖI: chuyển từ app.get(..., interceptor = cloudflareKiller) sang
+        // hydraxGet(...) — xem ghi chú đầy đủ tại khai báo hydraxClient/hydraxDispatcher.
+        // withContext(Dispatchers.IO) vì OkHttpClient.execute() ở đây là BLOCKING call
+        // (không phải app.get() vốn tự suspend đúng cách nội bộ), nên phải tự đẩy nó ra
+        // khỏi thread điều phối coroutine hiện tại để không chặn dispatcher chung của
+        // coroutine (khác với vấn đề dispatcher OkHttp nói ở trên — đây là dispatcher
+        // của Kotlin coroutines, cần tách biệt rõ để không nhầm lẫn 2 khái niệm).
+        var response = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { hydraxGet(embedUrl, headers, 15000) }.getOrNull()
+        }
 
         if (response == null || !response.isSuccessful) {
-            response = runCatching {
-                app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
-            }.getOrNull()
+            response = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching { hydraxGet(embedUrl, headers, 15000) }.getOrNull()
+            }
         }
 
         // Fail sớm và rõ ràng nếu Abyss trả lỗi HTTP (404/5xx/rate-limit...) hoặc lỗi
         // mạng cả 2 lần thử, thay vì để regex bên dưới âm thầm không tìm thấy "datas"
         // và trả null mập mờ — phân biệt được "trang embed lỗi" với "trang hợp lệ
         // nhưng đổi cấu trúc HTML".
-        if (response == null || !response.isSuccessful) return null
-        val html = response.text
+        if (response == null || !response.isSuccessful) {
+            response?.close()
+            return null
+        }
+        val html = response.use { it.body?.string() ?: "" }
 
         // HIỆU NĂNG: trước đây dùng Jsoup.parse() để dựng toàn bộ cây DOM của trang embed
         // rồi select("script") chỉ để tìm 1 dòng "const datas = ...". Parse DOM cho toàn
@@ -744,4 +809,5 @@ object HydraxInterceptor : Interceptor {
             HydraxExtractor.tokenForPathWithKey(path, tokenKey)
     }
 }
+ 
  
