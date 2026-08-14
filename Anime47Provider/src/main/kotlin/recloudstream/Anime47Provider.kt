@@ -986,43 +986,29 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
 
         // Chấp nhận mọi server có URL hợp lệ (FE, HY, hoặc bất kỳ server nào khác),
         // thay vì chỉ giới hạn ở "FE"/jwplayer.
-        //
-        // SỬA LỖI (structured concurrency): bọc catchNonCancellation() giống hệt nhánh
-        // HY ở trên. Toàn bộ các stream của 1 tập chạy song song trong cùng
-        // coroutineScope { streams.map { async {...} } }.awaitAll() } (loadEpisodeStreams()).
-        // Nếu nhánh này ném exception trần (vd. newExtractorLink() lỗi với URL bất
-        // thường), structured concurrency của Kotlin sẽ hủy luôn các async{} anh em khác
-        // của CÙNG tập đó — kể cả server đang chạy tốt. Bọc lại để lỗi 1 server không
-        // làm rớt các server còn lại của cùng episode.
-        val fallbackLoaded = catchNonCancellation({
-            val headers = mutableMapOf(
-                "Referer" to referer,
-                "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                "sec-ch-ua" to "\"Chromium\";v=\"120\", \"Not?A_Brand\";v=\"24\"",
-                "sec-ch-ua-mobile" to "?1",
-                "sec-ch-ua-platform" to "\"Android\""
-            )
+        val headers = mutableMapOf(
+            "Referer" to referer,
+            "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "sec-ch-ua" to "\"Chromium\";v=\"120\", \"Not?A_Brand\";v=\"24\"",
+            "sec-ch-ua-mobile" to "?1",
+            "sec-ch-ua-platform" to "\"Android\""
+        )
 
-            if (url.contains("vlogphim.net")) {
-                headers["Origin"] = referer
-                headers["authority"] = runCatching { URL(url).host }.getOrDefault("pl.vlogphim.net")
-            }
+        if (url.contains("vlogphim.net")) {
+            headers["Origin"] = referer
+            headers["authority"] = runCatching { URL(url).host }.getOrDefault("pl.vlogphim.net")
+        }
 
-            val link = newExtractorLink(name, stream.server_name ?: name, url, ExtractorLinkType.M3U8) {
-                this.referer = referer
-                this.headers = headers
-                this.quality = Qualities.Unknown.value
-            }
+        val link = newExtractorLink(name, stream.server_name ?: name, url, ExtractorLinkType.M3U8) {
+            this.referer = referer
+            this.headers = headers
+            this.quality = Qualities.Unknown.value
+        }
 
-            callback(link)
-            true
-        }, onError = {
-            false // bỏ qua lỗi riêng của server này, không chặn các server khác
-        })
-
-        if (fallbackLoaded) loaded.set(true)
+        callback(link)
+        loaded.set(true)
         forwardSubtitles()
-        return fallbackLoaded
+        return true
     }
 
     /**
@@ -1285,5 +1271,4 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         val results: List<SearchItem>?,
         val has_more: Boolean?
     )
-}
- 
+} 
