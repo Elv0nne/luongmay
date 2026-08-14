@@ -147,7 +147,15 @@ object HydraxExtractor {
     // ===================== id / metadata extraction =====================
 
     private fun getVideoId(url: String): String? {
-        val host = runCatching { URI(url).host }.getOrNull() ?: return url
+        // SỬA LỖI: trước đây khi URI(url).host ném exception (URL malformed) hoặc trả về
+        // null, hàm âm thầm coi CẢ URL GỐC là videoId (return url) thay vì báo lỗi (null).
+        // Điều này khiến getLinks() không dừng sớm ở "getVideoId(streamUrl) ?: return
+        // emptyList()" như logic mong đợi, mà tiếp tục gọi fetchMp4Metadata() với
+        // videoId = toàn bộ URL gốc, build ra embedUrl kiểu
+        // "https://abysscdn.com/?v=https://..." — chắc chắn sai và bị Abyss từ chối. Lỗi
+        // thật (URL hỏng) vì vậy bị che giấu thành "server HY không có link" chung chung,
+        // rất khó chẩn đoán từ log. Trả null ở đây để getLinks() dừng sớm và rõ ràng.
+        val host = runCatching { URI(url).host }.getOrNull() ?: return null
         return when {
             host.contains("short.ink") -> url.substringAfterLast("/")
             host.contains("abysscdn.com") || host.contains("playhydrax.com") || host.contains("zplayer.io") ->
@@ -456,6 +464,19 @@ object HydraxInterceptor : Interceptor {
         private var openSegIndex: Int = -1
 
         override fun read(sink: Buffer, byteCount: Long): Long {
+            // SỬA LỖI (vi phạm hợp đồng Okio Source.read()): Okio yêu cầu read() chỉ được
+            // trả về -1 (hết dữ liệu) hoặc số dương (đã đọc được ít nhất 1 byte); KHÔNG
+            // bao giờ được trả 0 khi byteCount > 0, nếu không caller (ví dụ okio.buffer(),
+            // hoặc chính player/ExoPlayer) có thể hiểu nhầm là "chưa có gì để đọc, thử lại
+            // ngay" và rơi vào vòng lặp bận (busy-loop)/treo vô hạn thay vì dừng đúng cách.
+            // byteCount == 0 là lời gọi hợp lệ (một số caller gọi read(sink, 0) để "poll"),
+            // nên phải trả về 0 NGAY LẬP TỨC ở đây trước khi chạy phần logic bên dưới —
+            // nếu không, `wantToRead = minOf(byteCount, ...)` phía dưới có thể tính ra 0
+            // ngay cả khi byteCount > 0 (do đã đọc hết phần còn lại của segment hiện tại
+            // đúng lúc currentPos chạm ranh giới), khiến hàm rơi vào nhánh "read <= 0" và
+            // hiểu lầm là lỗi mạng cần retry, dẫn tới việc mở lại connection không cần
+            // thiết hoặc treo khi retry cũng trả về 0.
+            if (byteCount == 0L) return 0L
             if (currentPos > endByteInclusive) return -1L
 
             val segIndex = (currentPos / FRAGMENT_SIZE).toInt()
@@ -504,6 +525,17 @@ object HydraxInterceptor : Interceptor {
             val remaining = endByteInclusive - currentPos + 1
             val segEndExclusive = minOf(segStart + FRAGMENT_SIZE, endByteInclusive + 1)
             val remainingInSegment = segEndExclusive - currentPos
+            // SỬA LỖI: nếu remainingInSegment <= 0 (currentPos đã chạm/vượt ranh giới
+            // segment do race hoặc sai lệch làm tròn dù check `currentPos > endByteInclusive`
+            // ở đầu hàm chưa bắt được), minOf(...) có thể ra 0 hoặc âm — trả thẳng cho Okio
+            // sẽ vi phạm hợp đồng read() (xem ghi chú ở đầu hàm). Coi trường hợp này là
+            // "đã hết segment hiện tại", đóng kết nối và trả -1 để caller tự gọi lại
+            // read() một lần nữa — lần gọi sau sẽ tính lại segIndex mới từ currentPos hiện
+            // tại (đã cập nhật đúng) thay vì cố đọc một lượng byte không hợp lệ (<= 0).
+            if (remainingInSegment <= 0) {
+                closeOpenConnection()
+                return -1L
+            }
             val wantToRead = minOf(byteCount, remaining, remainingInSegment, FRAGMENT_SIZE)
 
             // SỬA LỖI: Source.skip() của Okio có thể ném IOException nếu kết nối kết
@@ -712,3 +744,4 @@ object HydraxInterceptor : Interceptor {
             HydraxExtractor.tokenForPathWithKey(path, tokenKey)
     }
 }
+ 
