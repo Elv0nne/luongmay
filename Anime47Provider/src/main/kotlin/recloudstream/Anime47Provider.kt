@@ -19,7 +19,6 @@ import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.WatchProgressListener
 import com.lagradost.cloudstream3.addDubStatus
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.mainPageOf
@@ -89,7 +88,7 @@ private fun toJson(value: Any?): String {
     }
 }
 
-class Anime47Provider : MainAPI(), WatchProgressListener {
+class Anime47Provider : MainAPI() {
 
     override var mainUrl = "https://anime47.best"
     private val apiBaseUrl = "https://anime47.love/api"
@@ -143,115 +142,18 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
     // "$apiBaseUrl/dcc/watch-progress", được web gọi lặp lại mỗi ~30 giây trong lúc
     // phát với { episode_id, progress_seconds, seconds_watched: 30 }, và server chỉ
     // thưởng điểm khi progress_seconds tích lũy đạt khoảng ~80% thời lượng tập.
-    //
-    // CẬP NHẬT: bản CloudStream app đã được patch thêm interface
-    // com.lagradost.cloudstream3.WatchProgressListener — GeneratorPlayer.kt (module
-    // app) giờ gọi provider.onWatchProgress(data, positionMs, durationMs) mỗi khi vị
-    // trí phát thay đổi thật (throttle ~15s/lần), lấy trực tiếp từ ExoPlayer, không
-    // phải giả lập. Nhờ đó ta implement WatchProgressListener bên dưới để gọi
-    // watch-progress với progress_seconds/seconds_watched TÍNH TỪ vị trí phát thật,
-    // phản ánh đúng những gì user đang thực sự xem — không có timer tick giả nào chạy
-    // khi user không mở player. Yêu cầu: user phải dùng bản CloudStream đã patch hook
-    // này (bản gốc từ Cloudstream chính thức chưa có, vì không expose vị trí phát cho
-    // provider ngoài).
+    // Cloudstream's loadLinks() không có cách nào biết chính xác player đang phát
+    // đến giây thứ mấy hoặc user có thực sự đang xem hay không (không có hook theo
+    // dõi tiến trình phát từ phía provider). Vì việc gọi watch-progress đòi hỏi báo
+    // cáo thời lượng xem thực tế, ta KHÔNG giả lập heartbeat này ở đây — làm vậy sẽ
+    // là gửi dữ liệu "đã xem" không có thật lên server. Do đó điểm DCC theo thời
+    // gian xem sẽ KHÔNG được cộng tự động qua app; user vẫn cần xem qua web thật để
+    // nhận điểm đó. Phần dưới đây chỉ xử lý điểm danh + lưu lịch sử, là 2 hành vi
+    // phản ánh đúng thực tế thao tác của user trên app.
     //
     // Cả hai request đều "best effort": lỗi mạng/hết hạn token không được throw ra
     // ngoài, để không làm gián đoạn việc xem phim nếu hệ thống điểm gặp sự cố.
     private val dailyCheckinDone = AtomicBoolean(false)
-
-    // ===================== Watch-progress thật (WatchProgressListener) =====================
-    // State theo dõi lần báo watch-progress gần nhất cho MỖI episode đang phát, để tính
-    // seconds_watched = thời gian thực trôi qua giữa 2 lần gọi (không hardcode "30" như
-    // web, vì app có thể gọi ở nhịp khác tuỳ throttle phía GeneratorPlayer). Dùng Mutex vì
-    // onWatchProgress() có thể được gọi lại trong lúc lần gọi trước còn đang chạy nếu
-    // request mạng chậm hơn chu kỳ throttle.
-    private data class WatchProgressState(
-        val episodeId: Int,
-        var lastProgressSeconds: Long,
-        var lastReportedAtMs: Long
-    )
-
-    private val watchProgressState = java.util.concurrent.atomic.AtomicReference<WatchProgressState?>(null)
-    private val watchProgressMutex = Mutex()
-
-    /**
-     * Trích episode_id (Int) từ chuỗi "data" mà loadLinks() nhận — có thể là 1 số đơn lẻ
-     * ("123") hoặc 1 mảng JSON các id ("[123,456]") khi có nhiều nhóm dịch. Với trường hợp
-     * mảng, dùng phần tử đầu tiên: đây luôn là episode chính đang thật sự được phát trong
-     * player (các id còn lại trong mảng chỉ là server/nhóm dịch dự phòng cho CÙNG 1 tập,
-     * xem cách loadLinks() dùng episodeIds ở dưới), nên báo watch-progress cho id đầu là
-     * đúng và đủ.
-     */
-    private fun parseEpisodeIdFromData(data: String): Int? {
-        return try {
-            if (data.startsWith("[")) {
-                mapper.readValue(data, object : TypeReference<List<Int>>() {}).firstOrNull()
-            } else {
-                data.toIntOrNull()
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /**
-     * Gọi bởi GeneratorPlayer (module app, đã patch) mỗi khi vị trí phát thật thay đổi.
-     * Đây LÀ dữ liệu thật lấy từ ExoPlayer, không phải giả lập — nên an toàn để báo lên
-     * watch-progress giống hệt cách web thật làm.
-     */
-    override suspend fun onWatchProgress(data: String, positionMs: Long, durationMs: Long) {
-        if (durationMs <= 0L) return
-        val episodeId = parseEpisodeIdFromData(data) ?: return
-
-        val progressSeconds = positionMs / 1000
-        val now = System.currentTimeMillis()
-
-        // secondsWatched: thời gian thực trôi qua kể từ lần báo trước CHO CHÍNH episode
-        // này. Nếu đổi sang episode khác (id khác) hoặc đây là lần đầu, coi như mốc mới,
-        // không cộng dồn từ episode cũ.
-        val secondsWatched = watchProgressMutex.withLock {
-            val prev = watchProgressState.get()
-            val elapsed = if (prev != null && prev.episodeId == episodeId) {
-                ((now - prev.lastReportedAtMs) / 1000).coerceIn(1, 120)
-            } else {
-                // Lần đầu cho episode này: dùng chính progressSeconds hiện tại làm ước
-                // lượng hợp lý (vd. nếu user tua tới giữa phim rồi mới bắt đầu throttle
-                // window đầu tiên), nhưng chặn trần để tránh báo khống một cục lớn nếu
-                // user tua nhảy xa.
-                progressSeconds.coerceIn(1, 120)
-            }
-            watchProgressState.set(WatchProgressState(episodeId, progressSeconds, now))
-            elapsed
-        }
-
-        try {
-            val headers = getAuthHeaders()
-            if (!headers.containsKey("Authorization")) return // chưa đăng nhập, bỏ qua
-
-            val body = toJson(
-                mapOf(
-                    "episode_id" to episodeId,
-                    "progress_seconds" to progressSeconds,
-                    "seconds_watched" to secondsWatched
-                )
-            ).toRequestBody("application/json".toMediaTypeOrNull())
-
-            app.post(
-                "$apiBaseUrl/dcc/watch-progress",
-                headers = headers + mapOf(
-                    "origin" to mainUrl,
-                    "referer" to "$mainUrl/"
-                ),
-                requestBody = body,
-                interceptor = interceptor,
-                timeout = 10000
-            )
-        } catch (e: Exception) {
-            // Best effort: lỗi mạng/token hết hạn không được làm crash việc phát video.
-            // GeneratorPlayer cũng đã tự bọc try/catch quanh onWatchProgress(), đây là
-            // lớp phòng thủ thứ 2.
-        }
-    }
 
     // Lưu ý: hai hàm dưới đây (triggerDailyCheckinOnce, markEpisodeWatched) chỉ được gọi
     // qua "backgroundScope.launch { ... }" (xem getMainPage()/loadEpisodeStreams()), tức
