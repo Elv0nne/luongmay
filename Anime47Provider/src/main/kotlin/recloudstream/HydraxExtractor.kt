@@ -21,7 +21,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import okhttp3.Dispatcher
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
@@ -60,37 +59,6 @@ object HydraxExtractor {
     // nguyên nhân thực sự là chưa vượt được Cloudflare. Instance CloudflareKiller là
     // stateless/an toàn khi tái sử dụng nhiều lần, nên tạo 1 lần duy nhất ở cấp object.
     private val cloudflareKiller = CloudflareKiller()
-
-    // SỬA LỖI (nghiêm trọng — HY treo kéo theo cả FE): CloudflareKiller.intercept() chạy
-    // `runBlocking { bypassCloudflare(...) }`, và khi domain trả 403/503 kèm header
-    // Cloudflare, bypassCloudflare() mở WebViewResolver(...).resolveUsingWebView(url) rồi
-    // CHỜ tới DEFAULT_TIMEOUT = 60_000L (60 giây, xem WebViewResolver trong app core) nếu
-    // WebView không tự thoát sớm hơn. Vấn đề: request app.get(embedUrl, interceptor =
-    // cloudflareKiller, ...) ở fetchMp4Metadata() bên dưới trước đây chạy trên
-    // `app` mặc định — tức dùng chung app.baseClient, một OkHttpClient SINGLETON cho TOÀN
-    // BỘ ứng dụng (mọi provider, mọi extractor, kể cả server FE của chính Anime47Provider
-    // và mọi provider khác đang cài). app.baseClient không tự cấu hình Dispatcher riêng,
-    // nên áp dụng dispatcher mặc định của OkHttp (maxRequests = 64 toàn app, maxRequestsPerHost
-    // = 5). Khi runBlocking bên trong CloudflareKiller giữ chặt 1 thread I/O của dispatcher
-    // DÙNG CHUNG này trong lúc chờ WebView (tối đa 60s), mọi request khác đi qua cùng
-    // dispatcher — kể cả bấm sang server FE ngay sau khi HY lỗi — phải xếp hàng chờ, tạo
-    // đúng hiện tượng "bấm HY lỗi rồi bấm FE cũng lỗi/treo theo".
-    //
-    // Fix: cấp cho HydraxExtractor một OkHttpClient RIÊNG, có Dispatcher RIÊNG (thread pool
-    // độc lập với app.baseClient), chỉ dùng cho các request đi qua cloudflareKiller của HY.
-    // Dù runBlocking vẫn giữ 1 thread trong pool riêng này tới 60s khi gặp Cloudflare
-    // challenge thật, nó không còn thể làm nghẽn dispatcher dùng chung cho FE/các provider
-    // khác nữa — lỗi (nếu có) chỉ còn cô lập trong phạm vi HY.
-    private val hydraxDispatcher = Dispatcher().apply {
-        // Pool nhỏ là đủ: chỉ HydraxExtractor dùng client này, và số request HY chạy
-        // song song trong 1 lượt loadLinks() hiếm khi vượt quá vài chục (số tập x số
-        // server HY của mỗi tập).
-        maxRequests = 16
-        maxRequestsPerHost = 8
-    }
-    private val hydraxClient = OkHttpClient.Builder()
-        .dispatcher(hydraxDispatcher)
-        .build()
 
     // HIỆU NĂNG: biên dịch 1 lần duy nhất khi object được load (Kotlin "object" là
     // singleton) thay vì mỗi lần gọi fetchMp4Metadata() — tức mỗi lần lấy link cho
@@ -179,15 +147,7 @@ object HydraxExtractor {
     // ===================== id / metadata extraction =====================
 
     private fun getVideoId(url: String): String? {
-        // SỬA LỖI: trước đây khi URI(url).host ném exception (URL malformed) hoặc trả về
-        // null, hàm âm thầm coi CẢ URL GỐC là videoId (return url) thay vì báo lỗi (null).
-        // Điều này khiến getLinks() không dừng sớm ở "getVideoId(streamUrl) ?: return
-        // emptyList()" như logic mong đợi, mà tiếp tục gọi fetchMp4Metadata() với
-        // videoId = toàn bộ URL gốc, build ra embedUrl kiểu
-        // "https://abysscdn.com/?v=https://..." — chắc chắn sai và bị Abyss từ chối. Lỗi
-        // thật (URL hỏng) vì vậy bị che giấu thành "server HY không có link" chung chung,
-        // rất khó chẩn đoán từ log. Trả null ở đây để getLinks() dừng sớm và rõ ràng.
-        val host = runCatching { URI(url).host }.getOrNull() ?: return null
+        val host = runCatching { URI(url).host }.getOrNull() ?: return url
         return when {
             host.contains("short.ink") -> url.substringAfterLast("/")
             host.contains("abysscdn.com") || host.contains("playhydrax.com") || host.contains("zplayer.io") ->
@@ -201,28 +161,6 @@ object HydraxExtractor {
         }
     }
 
-    /**
-     * Thực hiện GET qua hydraxClient (dispatcher/thread pool RIÊNG, không phải
-     * app.baseClient dùng chung) nhưng vẫn áp dụng cloudflareKiller để tự vượt challenge
-     * nếu abysscdn.com/playhydrax.com/zplayer.io bật Cloudflare. Xem ghi chú tại khai báo
-     * hydraxClient/hydraxDispatcher ở trên: đây là điểm mấu chốt cô lập HY khỏi FE.
-     */
-    private fun hydraxGet(url: String, headers: Map<String, String>, timeoutMs: Long): Response {
-        val requestBuilder = Request.Builder().url(url)
-        headers.forEach { (k, v) -> requestBuilder.addHeader(k, v) }
-        val request = requestBuilder.build()
-
-        val callClient = hydraxClient.newBuilder()
-            .callTimeout(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-            // cloudflareKiller.intercept() tự runBlocking + tự chain.proceed(), nên gắn
-            // như một application interceptor bình thường của hydraxClient là đủ — nó sẽ
-            // chạy TRÊN thread pool riêng của hydraxDispatcher, không phải của app.baseClient.
-            .addInterceptor(cloudflareKiller)
-            .build()
-
-        return callClient.newCall(request).execute()
-    }
-
     private suspend fun fetchMp4Metadata(videoId: String, referer: String): Mp4Data? {
         val embedUrl = "$ABYSS_BASE_URL/?v=$videoId"
         val headers = mapOf(
@@ -234,33 +172,22 @@ object HydraxExtractor {
         // thoáng qua dưới tải cao. Thử lại tối đa 1 lần (tổng 2 lần gọi) trước khi coi
         // là thất bại thật — giảm tỷ lệ "server HY không có link" giả do mạng chập chờn
         // thay vì lỗi thật sự từ phía Abyss.
-        //
-        // SỬA LỖI: chuyển từ app.get(..., interceptor = cloudflareKiller) sang
-        // hydraxGet(...) — xem ghi chú đầy đủ tại khai báo hydraxClient/hydraxDispatcher.
-        // withContext(Dispatchers.IO) vì OkHttpClient.execute() ở đây là BLOCKING call
-        // (không phải app.get() vốn tự suspend đúng cách nội bộ), nên phải tự đẩy nó ra
-        // khỏi thread điều phối coroutine hiện tại để không chặn dispatcher chung của
-        // coroutine (khác với vấn đề dispatcher OkHttp nói ở trên — đây là dispatcher
-        // của Kotlin coroutines, cần tách biệt rõ để không nhầm lẫn 2 khái niệm).
-        var response = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            runCatching { hydraxGet(embedUrl, headers, 15000) }.getOrNull()
-        }
+        var response = runCatching {
+            app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
+        }.getOrNull()
 
         if (response == null || !response.isSuccessful) {
-            response = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                runCatching { hydraxGet(embedUrl, headers, 15000) }.getOrNull()
-            }
+            response = runCatching {
+                app.get(embedUrl, headers = headers, interceptor = cloudflareKiller, timeout = 15000)
+            }.getOrNull()
         }
 
         // Fail sớm và rõ ràng nếu Abyss trả lỗi HTTP (404/5xx/rate-limit...) hoặc lỗi
         // mạng cả 2 lần thử, thay vì để regex bên dưới âm thầm không tìm thấy "datas"
         // và trả null mập mờ — phân biệt được "trang embed lỗi" với "trang hợp lệ
         // nhưng đổi cấu trúc HTML".
-        if (response == null || !response.isSuccessful) {
-            response?.close()
-            return null
-        }
-        val html = response.use { it.body?.string() ?: "" }
+        if (response == null || !response.isSuccessful) return null
+        val html = response.text
 
         // HIỆU NĂNG: trước đây dùng Jsoup.parse() để dựng toàn bộ cây DOM của trang embed
         // rồi select("script") chỉ để tìm 1 dòng "const datas = ...". Parse DOM cho toàn
@@ -529,19 +456,6 @@ object HydraxInterceptor : Interceptor {
         private var openSegIndex: Int = -1
 
         override fun read(sink: Buffer, byteCount: Long): Long {
-            // SỬA LỖI (vi phạm hợp đồng Okio Source.read()): Okio yêu cầu read() chỉ được
-            // trả về -1 (hết dữ liệu) hoặc số dương (đã đọc được ít nhất 1 byte); KHÔNG
-            // bao giờ được trả 0 khi byteCount > 0, nếu không caller (ví dụ okio.buffer(),
-            // hoặc chính player/ExoPlayer) có thể hiểu nhầm là "chưa có gì để đọc, thử lại
-            // ngay" và rơi vào vòng lặp bận (busy-loop)/treo vô hạn thay vì dừng đúng cách.
-            // byteCount == 0 là lời gọi hợp lệ (một số caller gọi read(sink, 0) để "poll"),
-            // nên phải trả về 0 NGAY LẬP TỨC ở đây trước khi chạy phần logic bên dưới —
-            // nếu không, `wantToRead = minOf(byteCount, ...)` phía dưới có thể tính ra 0
-            // ngay cả khi byteCount > 0 (do đã đọc hết phần còn lại của segment hiện tại
-            // đúng lúc currentPos chạm ranh giới), khiến hàm rơi vào nhánh "read <= 0" và
-            // hiểu lầm là lỗi mạng cần retry, dẫn tới việc mở lại connection không cần
-            // thiết hoặc treo khi retry cũng trả về 0.
-            if (byteCount == 0L) return 0L
             if (currentPos > endByteInclusive) return -1L
 
             val segIndex = (currentPos / FRAGMENT_SIZE).toInt()
@@ -590,17 +504,6 @@ object HydraxInterceptor : Interceptor {
             val remaining = endByteInclusive - currentPos + 1
             val segEndExclusive = minOf(segStart + FRAGMENT_SIZE, endByteInclusive + 1)
             val remainingInSegment = segEndExclusive - currentPos
-            // SỬA LỖI: nếu remainingInSegment <= 0 (currentPos đã chạm/vượt ranh giới
-            // segment do race hoặc sai lệch làm tròn dù check `currentPos > endByteInclusive`
-            // ở đầu hàm chưa bắt được), minOf(...) có thể ra 0 hoặc âm — trả thẳng cho Okio
-            // sẽ vi phạm hợp đồng read() (xem ghi chú ở đầu hàm). Coi trường hợp này là
-            // "đã hết segment hiện tại", đóng kết nối và trả -1 để caller tự gọi lại
-            // read() một lần nữa — lần gọi sau sẽ tính lại segIndex mới từ currentPos hiện
-            // tại (đã cập nhật đúng) thay vì cố đọc một lượng byte không hợp lệ (<= 0).
-            if (remainingInSegment <= 0) {
-                closeOpenConnection()
-                return -1L
-            }
             val wantToRead = minOf(byteCount, remaining, remainingInSegment, FRAGMENT_SIZE)
 
             // SỬA LỖI: Source.skip() của Okio có thể ném IOException nếu kết nối kết
@@ -808,6 +711,4 @@ object HydraxInterceptor : Interceptor {
         private fun tokenFor(path: String): String =
             HydraxExtractor.tokenForPathWithKey(path, tokenKey)
     }
-}
- 
- 
+} 
