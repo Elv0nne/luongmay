@@ -225,7 +225,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
         }
 
         try {
-            val headers = getAuthHeaders()
+            var headers = getAuthHeaders()
             if (!headers.containsKey("Authorization")) return // chưa đăng nhập, bỏ qua
 
             val body = toJson(
@@ -236,7 +236,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 )
             ).toRequestBody("application/json".toMediaTypeOrNull())
 
-            app.post(
+            val response = app.post(
                 "$apiBaseUrl/dcc/watch-progress",
                 headers = headers + mapOf(
                     "origin" to mainUrl,
@@ -246,10 +246,42 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 interceptor = interceptor,
                 timeout = 10000
             )
+
+            // SỬA LỖI (mất điểm âm thầm khi JWT hết hạn giữa lúc đang xem): khác với
+            // fetchApi() (dùng cho /dcc/info, /profile/...), hàm này trước đây KHÔNG có
+            // bước phát hiện token hết hạn + login lại + retry. getAuthHeaders() ở trên
+            // chỉ trả về token đang cache SẴN CÓ mà không kiểm tra token đó còn hợp lệ
+            // hay không (ensureToken() chỉ tự login lại khi cache RỖNG, không phải khi
+            // cache có nhưng đã hết hạn). Vì JWT thường có thời hạn ngắn và người dùng có
+            // thể xem phim liên tục nhiều giờ, token rất dễ hết hạn NGAY GIỮA một phiên
+            // xem đang chạy — khi đó mọi request watch-progress từ lúc đó trở đi bị
+            // server từ chối (401 / PRIVATE_MODE) nhưng bị catch(Exception) bên dưới nuốt
+            // hoàn toàn im lặng (đây vốn là "best effort" nên không throw ra ngoài), nên
+            // KHÔNG có dấu hiệu lỗi nào hiển thị cho người dùng — trông giống hệt trường
+            // hợp "watch-progress không hoạt động" dù request vẫn được gửi đều đặn. Sửa
+            // bằng cách: nếu response cho thấy token hết hạn/không hợp lệ, ép login lại
+            // (forceRefresh = true, giống cơ chế đã có ở fetchApi()) rồi gửi lại DUY NHẤT
+            // một lần với token mới, thay vì bỏ cuộc ngay.
+            if (looksExpiredOrUnauthorized(response.text) || response.code == 401) {
+                val staleToken = headers["Authorization"]?.removePrefix("Bearer ")
+                val retryHeaders = getAuthHeaders(forceRefresh = true, staleToken = staleToken)
+                if (retryHeaders.containsKey("Authorization")) {
+                    headers = retryHeaders
+                    app.post(
+                        "$apiBaseUrl/dcc/watch-progress",
+                        headers = headers + mapOf(
+                            "origin" to mainUrl,
+                            "referer" to "$mainUrl/"
+                        ),
+                        requestBody = body,
+                        interceptor = interceptor,
+                        timeout = 10000
+                    )
+                }
+            }
         } catch (e: Exception) {
-            // Best effort: lỗi mạng/token hết hạn không được làm crash việc phát video.
-            // GeneratorPlayer cũng đã tự bọc try/catch quanh onWatchProgress(), đây là
-            // lớp phòng thủ thứ 2.
+            // Best effort: lỗi mạng không được làm crash việc phát video. GeneratorPlayer
+            // cũng đã tự bọc try/catch quanh onWatchProgress(), đây là lớp phòng thủ thứ 2.
         }
     }
 
