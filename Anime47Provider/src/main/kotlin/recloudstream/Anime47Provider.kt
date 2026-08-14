@@ -1111,7 +1111,7 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
 
         // Biên dịch 1 lần duy nhất cho toàn bộ vòng đời class thay vì mỗi lần gọi
         // getVideoInterceptor().
-        private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit")
+        private val cdnFixRegex = Regex("nonprofit\\.asia|cdn\\d+\\.nonprofit|vlogphim\\.net")
 
         // Cửa sổ "peek" đủ rộng (~32 gói TS = ~6KB) để tìm byte đồng bộ MPEG-TS (0x47)
         // mà không cần đọc toàn bộ file — phần rác thường chỉ nằm ở vài trăm byte đầu.
