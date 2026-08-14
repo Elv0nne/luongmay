@@ -71,8 +71,28 @@ subprojects {
         val cloudstream by configurations
         val implementation by configurations
 
-        // Stubs for all cloudstream classes
-        cloudstream("com.lagradost:cloudstream3:pre-release")
+        // Stubs for all cloudstream classes.
+        //
+        // ĐÃ SỬA: trỏ sang bản fork đã patch (thêm WatchProgressListener vào
+        // MainAPI.kt + forward vị trí phát thật trong GeneratorPlayer.kt) thay vì
+        // "com.lagradost:cloudstream3:pre-release" chính thức — bản chính thức
+        // KHÔNG có interface WatchProgressListener nên biên dịch sẽ lỗi
+        // "Unresolved reference 'WatchProgressListener'".
+        //
+        // XÁC NHẬN THẬT qua JitPack build log (2026-08-14): coordinate
+        // "com.github.Elv0nne.cloudstream:library:9b9ae65" build SUCCESSFUL, publish
+        // đúng 3 artifact (library, library-jvm, library-android) — dùng thẳng
+        // "library" để Gradle/cloudstream plugin tự chọn đúng variant (android/jvm)
+        // theo target đang build, không cần chỉ định hậu tố thủ công.
+        //
+        // Dùng version cố định là commit hash "9b9ae65" (không dùng tag "pre-release"
+        // vì tag đó bị MOVE lại mỗi lần push mới lên Elv0nne/cloudstream, không đảm
+        // bảo luôn trỏ đúng bản đã build-verify này). Nếu sau này patch thêm code
+        // trên fork, thay "9b9ae65" bằng commit hash mới, rồi tự verify lại qua
+        // https://jitpack.io/#Elv0nne/cloudstream/<commit-hash> (bấm "Get it", đợi
+        // "BUILD SUCCESSFUL") trước khi build plugin, để tránh build lỗi hoặc dùng
+        // nhầm bản jitpack cache cũ.
+        cloudstream("com.github.Elv0nne.cloudstream:library:9b9ae65")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
