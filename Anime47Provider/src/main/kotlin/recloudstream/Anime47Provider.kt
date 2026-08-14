@@ -1,6 +1,7 @@
 package recloudstream
 
 import android.content.SharedPreferences
+import android.util.Log
 import com.fasterxml.jackson.core.type.TypeReference
 import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -226,15 +227,19 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
 
         try {
             var headers = getAuthHeaders()
-            if (!headers.containsKey("Authorization")) return // chưa đăng nhập, bỏ qua
+            if (!headers.containsKey("Authorization")) {
+                Log.d("WatchProgressDebug", "onWatchProgress SKIPPED: no Authorization header (chưa đăng nhập hoặc token null)")
+                return // chưa đăng nhập, bỏ qua
+            }
 
-            val body = toJson(
-                mapOf(
-                    "episode_id" to episodeId,
-                    "progress_seconds" to progressSeconds,
-                    "seconds_watched" to secondsWatched
-                )
-            ).toRequestBody("application/json".toMediaTypeOrNull())
+            val bodyMap = mapOf(
+                "episode_id" to episodeId,
+                "progress_seconds" to progressSeconds,
+                "seconds_watched" to secondsWatched
+            )
+            Log.d("WatchProgressDebug", "onWatchProgress SENDING body=$bodyMap")
+
+            val body = toJson(bodyMap).toRequestBody("application/json".toMediaTypeOrNull())
 
             val response = app.post(
                 "$apiBaseUrl/dcc/watch-progress",
@@ -246,6 +251,8 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                 interceptor = interceptor,
                 timeout = 10000
             )
+
+            Log.d("WatchProgressDebug", "onWatchProgress RESPONSE code=${response.code} text=${response.text}")
 
             // SỬA LỖI (mất điểm âm thầm khi JWT hết hạn giữa lúc đang xem): khác với
             // fetchApi() (dùng cho /dcc/info, /profile/...), hàm này trước đây KHÔNG có
@@ -263,11 +270,12 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
             // (forceRefresh = true, giống cơ chế đã có ở fetchApi()) rồi gửi lại DUY NHẤT
             // một lần với token mới, thay vì bỏ cuộc ngay.
             if (looksExpiredOrUnauthorized(response.text) || response.code == 401) {
+                Log.d("WatchProgressDebug", "onWatchProgress token looks stale -> forcing re-login + retry")
                 val staleToken = headers["Authorization"]?.removePrefix("Bearer ")
                 val retryHeaders = getAuthHeaders(forceRefresh = true, staleToken = staleToken)
                 if (retryHeaders.containsKey("Authorization")) {
                     headers = retryHeaders
-                    app.post(
+                    val retryResponse = app.post(
                         "$apiBaseUrl/dcc/watch-progress",
                         headers = headers + mapOf(
                             "origin" to mainUrl,
@@ -277,9 +285,13 @@ class Anime47Provider : MainAPI(), WatchProgressListener {
                         interceptor = interceptor,
                         timeout = 10000
                     )
+                    Log.d("WatchProgressDebug", "onWatchProgress RETRY RESPONSE code=${retryResponse.code} text=${retryResponse.text}")
+                } else {
+                    Log.d("WatchProgressDebug", "onWatchProgress RETRY SKIPPED: re-login failed, no new token")
                 }
             }
         } catch (e: Exception) {
+            Log.e("WatchProgressDebug", "onWatchProgress EXCEPTION", e)
             // Best effort: lỗi mạng không được làm crash việc phát video. GeneratorPlayer
             // cũng đã tự bọc try/catch quanh onWatchProgress(), đây là lớp phòng thủ thứ 2.
         }
