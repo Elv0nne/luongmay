@@ -2,6 +2,39 @@ import com.android.build.gradle.BaseExtension
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+import java.net.URI
+import java.net.HttpURLConnection
+
+// TỰ ĐỘNG LẤY COMMIT HASH CỦA TAG "pre-release" (thay vì hardcode tay như trước).
+// Lý do: overrideUrlPrefix() bên dưới tải classes.jar (dùng lúc RUNTIME) theo TAG
+// "pre-release", và tag này bị move tới commit mới nhất trên master mỗi lần push
+// (xem prerelease.yml). Nếu coordinate JitPack (dùng để compile stub) bị hardcode
+// một hash cũ, plugin sẽ build lệch khỏi app thật đang chạy -> lỗi hàng loạt.
+// Gọi GitHub API ngay tại thời điểm build để lấy ĐÚNG commit mà tag đang trỏ tới,
+// đảm bảo compile-time stub và runtime classes.jar luôn khớp nhau tự động.
+fun resolvePreReleaseCommitHash(): String {
+    val fallback = "d4b0843" // dùng nếu API lỗi/rate-limit, tránh build fail hoàn toàn
+    return try {
+        val url = URI("https://api.github.com/repos/Elv0nne/cloudstream/git/ref/tags/pre-release").toURL()
+        val conn = url.openConnection() as HttpURLConnection
+        conn.setRequestProperty("Accept", "application/vnd.github+json")
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 10_000
+        val text = conn.inputStream.bufferedReader().readText()
+        // Tag "pre-release" là lightweight tag -> object.sha ở ref API CHÍNH LÀ commit
+        // hash luôn (không phải annotated tag object cần thêm 1 lượt gọi resolve nữa).
+        val sha = Regex("\"sha\"\\s*:\\s*\"([0-9a-f]{7,40})\"").find(text)?.groupValues?.get(1)
+        (sha?.take(7) ?: fallback).also {
+            logger.lifecycle("[Anime47Provider] resolved pre-release commit = $it")
+        }
+    } catch (e: Exception) {
+        logger.warn("[Anime47Provider] Không lấy được commit hash pre-release qua API (${e.message}), dùng fallback=$fallback. " +
+            "Nếu app trên máy KHÔNG phải build từ commit $fallback, hãy build lại khi có mạng để tự động khớp đúng bản.")
+        fallback
+    }
+}
+
+val preReleaseCommitHash = resolvePreReleaseCommitHash()
 
 buildscript {
     repositories {
@@ -121,7 +154,17 @@ subprojects {
         // https://jitpack.io/#Elv0nne/cloudstream/<commit-hash> (bấm "Get it", đợi
         // "BUILD SUCCESSFUL") trước khi build plugin, để tránh build lỗi hoặc dùng
         // nhầm bản jitpack cache cũ.
-        cloudstream("com.github.Elv0nne.cloudstream:library:9b9ae65")
+        // TỰ ĐỘNG: dùng đúng commit mà tag "pre-release" đang trỏ tới NGAY LÚC build
+        // này chạy (xem resolvePreReleaseCommitHash() ở đầu file) — không còn hardcode
+        // tay, nên compile-time stub và runtime classes.jar (tải qua overrideUrlPrefix
+        // ở trên, cũng theo tag "pre-release") luôn tự khớp nhau.
+        //
+        // LƯU Ý QUAN TRỌNG: cách này chỉ đúng nếu bạn build LẠI PLUGIN mỗi khi build
+        // lại APP (APK mới = tag pre-release đã move sang commit mới). Nếu bạn build
+        // app xong, ĐỢI một lúc rồi mới build plugin, và trong lúc đó push thêm commit
+        // khác lên fork, tag sẽ move tiếp -> vẫn có thể lệch. An toàn nhất: build app
+        // và build plugin ngay sát nhau, không push gì ở giữa.
+        cloudstream("com.github.Elv0nne.cloudstream:library:$preReleaseCommitHash")
 
         // These dependencies can include any of those which are added by the app,
         // but you don't need to include any of them if you don't need them.
@@ -137,4 +180,4 @@ subprojects {
 
 task<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
-}
+} 
